@@ -1,0 +1,8 @@
+#!/bin/sh
+# Copyright 2015 David Goldfarb
+# May be copied, modified, used, bent, spindled, or mutilated freely, however you want
+
+lsof -i -P | grep -i "listen"
+
+
+

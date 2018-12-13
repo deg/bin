@@ -1,0 +1,18 @@
+#!/bin/sh
+# Copyright 2012 David Goldfarb
+#
+# Start a new github local repo
+#
+# Usage:
+#   githubinit <newdir> <url> <branch>
+#
+# Example:
+#   githubinit seesaw git@github.com:daveray/seesaw.git develop
+
+mkdir $1
+cd $1
+git init
+git remote add github $2
+# Next line not quite right. Errs, but right thing seems to happen
+git pull github
+git checkout -b $3 github/$3

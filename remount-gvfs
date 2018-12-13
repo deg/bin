@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# Use this when shares don't appear under /run/user/1000/gvfs
+# See https://askubuntu.com/questions/705030/gvsf-empty-gvsf-fuse-not-working-ubuntu-14-04
+
+sudo umount -l /run/user/1000/gvfs
+/usr/lib/gvfs/gvfsd-fuse /run/user/1000/gvfs -o big_writes

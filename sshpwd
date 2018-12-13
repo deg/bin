@@ -1,0 +1,9 @@
+#!/bin/sh
+# Copyright 2012 David Goldfarb
+#
+# Cache ssh pass phrases to minimize git push annoyances
+# see http://stackoverflow.com/questions/6106137/git-enter-long-passphrase-for-every-push
+
+# ssh-agent bash
+ssh-add ~/.ssh/id_rsa_github
+ssh-add ~/.ssh/id_rsa_bitbucket

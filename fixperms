@@ -1,0 +1,8 @@
+#!/bin/sh
+# Copyright 2016 David Goldfarb
+# May be copied, modified, used, bent, spindled, or mutilated freely, however you want
+
+# Fix permissions mangled by copying a git repo through windows.
+# Not perfect -- has no checking -- but covers the case that annoys me
+
+git status --porcelain $1 | grep " M " | sed -r 's/^.{3}//' | xargs chmod -x

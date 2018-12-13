@@ -1,0 +1,11 @@
+Use crontab -e
+
+Keep Heroku sites alive; they shut down after 60 minutes idle
+    15 * * * * curl http://receipts.goldfarb-family.com
+    37 * * * * curl http://receipts.goldfarb-family.com
+
+
+Record home IP address in Dropbox, in case DDNS fails (idea from Linux Journal, Mar 2013)
+    1 * * * * /usr/bin/wget --quiet -O ~/Dropbox/Public/IP.txt http://snar.co/ip
+
+    

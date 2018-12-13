@@ -1,0 +1,6 @@
+#!/bin/bash
+
+# See https://communities.vmware.com/thread/499790?start=15&tstart=0
+# But see also continuation of ideas: https://communities.vmware.com/thread/499790?start=30&tstart=0 and http://costatechnet.blogspot.co.il/2015/10/vmware-vmx-eating-cpu-100-and-freezes.html
+
+vblank_mode=0 /usr/lib/vmware/bin/vmplayer &
