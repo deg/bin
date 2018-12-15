@@ -2,5 +2,5 @@
 # Copyright 2018 David Goldfarb
 # May be copied by anyone, for any purpose
 
-cd ~/Documents/git/clients/Basistech-projects/OpenVPN/Linux/Basis_VPN/
+cd ~/OpenVPN/Linux/Basis_VPN/
 sudo openvpn --config Basis.ovpn
