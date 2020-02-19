@@ -1,0 +1,6 @@
+#!/bin/bash
+
+# default location
+LOC="${1:-Beit Shemesh, Israel}"
+
+curl -s "http://wttr.in/$LOC?T"
