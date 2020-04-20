@@ -1,0 +1,5 @@
+#!/bin/sh
+# GC all git repos in directory tree
+# From https://fvdm.com/code/recursively-clean-up-local-git-repositories
+export arg=$@
+find . -name '.git' -type d -exec bash -c 'path=${1%/.git}; echo $path; cd "$path" && git gc $arg' 0 {} \;
