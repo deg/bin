@@ -1,0 +1,3 @@
+#!/bin/sh
+find . -type d \( -name 'node_modules' -o -name '.venv' -o -name '.git' \
+  -o -name '.mypy_cache' -o -name '__pycache__' \) -prune -o -type d -print | sed -e 's;[^/]*/;|____;g;s;____|; |;g'
