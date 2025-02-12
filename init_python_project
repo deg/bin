@@ -20,12 +20,32 @@ else
   project_name=$1
 fi
 
+# Check if project directory already exists
+if [ -d "$project_name" ]; then
+  echo "❌ Directory '$project_name' already exists. Aborting."
+  exit 1
+fi
+
 # Prompt to initialize a Git repository
-read -p "Initialize a Git repository? (y/n): " init_git
+PS3="Choose an option: "
+echo "Do you want to initialize a Git repository?"
+select init_git in "Yes" "No"; do
+  case $init_git in
+    Yes ) init_git="y"; break;;
+    No ) init_git="n"; break;;
+    * ) echo "Please choose 1 or 2.";;
+  esac
+done
 
 # Prompt to add a license
-read -p "Add a license file (MIT/Apache-2.0/None)? [MIT]: " license_choice
-license_choice=${license_choice:-MIT}  # Default to MIT
+echo "Select a license type:"
+select license_choice in "MIT" "Apache-2.0" "None"; do
+  case $license_choice in
+    MIT | Apache-2.0 ) break;;
+    None ) license_choice="None"; break;;
+    * ) echo "Please choose 1, 2, or 3.";;
+  esac
+done
 
 # Create project directory
 mkdir -p "$project_name"/tests
