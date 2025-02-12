@@ -13,6 +13,21 @@
 # - Pre-commit hooks
 # - Makefile for common tasks
 
+# Check if 'gum' is installed, if not, install it
+if ! command -v gum &> /dev/null; then
+  echo "⚡ 'gum' is not installed. Installing now..."
+  if command -v brew &> /dev/null; then
+    brew install charmbracelet/tap/gum
+  elif command -v apt-get &> /dev/null; then
+    sudo apt-get update && sudo apt-get install -y gum
+  elif command -v dnf &> /dev/null; then
+    sudo dnf install -y gum
+  else
+    echo "❌ Could not detect a supported package manager (brew, apt, dnf). Please install 'gum' manually."
+    exit 1
+  fi
+fi
+
 # Prompt for project name if not supplied
 if [ -z "$1" ]; then
   read -p "Enter project name: " project_name
@@ -27,25 +42,10 @@ if [ -d "$project_name" ]; then
 fi
 
 # Prompt to initialize a Git repository
-PS3="Choose an option: "
-echo "Do you want to initialize a Git repository?"
-select init_git in "Yes" "No"; do
-  case $init_git in
-    Yes ) init_git="y"; break;;
-    No ) init_git="n"; break;;
-    * ) echo "Please choose 1 or 2.";;
-  esac
-done
+init_git=$(gum choose "Yes" "No" --header="Do you want to initialize a Git repository?")
 
 # Prompt to add a license
-echo "Select a license type:"
-select license_choice in "MIT" "Apache-2.0" "None"; do
-  case $license_choice in
-    MIT | Apache-2.0 ) break;;
-    None ) license_choice="None"; break;;
-    * ) echo "Please choose 1, 2, or 3.";;
-  esac
-done
+license_choice=$(gum choose "MIT" "Apache-2.0" "None" --header="Select a license type:")
 
 # Create project directory
 mkdir -p "$project_name"/tests
@@ -181,7 +181,7 @@ fi
 # =====================
 # Git Initialization (Optional)
 # =====================
-if [ "$init_git" = "y" ] || [ "$init_git" = "Y" ]; then
+if [ "$init_git" = "Yes" ]; then
   git init
   git add .
   git commit -m "Initial commit"
