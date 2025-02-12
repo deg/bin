@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# Prompt for project name if not supplied
+if [ -z "$1" ]; then
+  read -p "Enter project name: " project_name
+else
+  project_name=$1
+fi
+
+# Prompt to initialize a Git repository
+read -p "Initialize a Git repository? (y/n): " init_git
+
+# Create project directory
+mkdir -p "$project_name"/tests
+cd "$project_name" || exit
+
+# Initialize Poetry project
+poetry init --no-interaction --name "$project_name"
+poetry add --dev pyright black isort flake8 pytest mypy coverage
+
+# Create initial Python files
+echo "def main():\n    print(\"Hello, World!\")" > main.py
+echo "" > tests/test_main.py
+
+echo "# $project_name" > README.md
+
+# Create .gitignore
+cat <<EOL > .gitignore
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Poetry
+poetry.lock
+EOL
+
+# Initialize Git repository if selected
+if [ "$init_git" = "y" ] || [ "$init_git" = "Y" ]; then
+  git init
+  git add .
+  git commit -m "Initial commit"
+fi
+
+# Display success message
+echo "✅ Python project '$project_name' initialized successfully!"
