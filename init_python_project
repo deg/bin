@@ -1,5 +1,18 @@
 #!/bin/bash
 
+# =========================
+# Python Project Initializer
+# =========================
+# Features:
+# - Project scaffolding with Poetry
+# - Git repository setup
+# - Pre-configured pyproject.toml for code style tools
+# - GitHub Actions CI/CD pipeline
+# - Sample test cases
+# - Optional license file
+# - Pre-commit hooks
+# - Makefile for common tasks
+
 # Prompt for project name if not supplied
 if [ -z "$1" ]; then
   read -p "Enter project name: " project_name
@@ -10,21 +23,60 @@ fi
 # Prompt to initialize a Git repository
 read -p "Initialize a Git repository? (y/n): " init_git
 
+# Prompt to add a license
+read -p "Add a license file (MIT/Apache-2.0/None)? [MIT]: " license_choice
+license_choice=${license_choice:-MIT}  # Default to MIT
+
 # Create project directory
 mkdir -p "$project_name"/tests
 cd "$project_name" || exit
 
-# Initialize Poetry project
+# =====================
+# Poetry Project Setup
+# =====================
 poetry init --no-interaction --name "$project_name"
-poetry add --dev pyright black isort flake8 pytest mypy coverage
+poetry add --dev pyright black isort flake8 pytest mypy coverage pre-commit
 
-# Create initial Python files
+# =====================
+# Pre-configured pyproject.toml
+# =====================
+cat <<EOL >> pyproject.toml
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203"]
+
+[tool.mypy]
+strict = true
+
+[tool.pytest]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = ["tests"]
+EOL
+
+# =====================
+# Sample Python Files
+# =====================
 echo "def main():\n    print(\"Hello, World!\")" > main.py
-echo "" > tests/test_main.py
+
+# Sample Test Case
+echo "def test_example():\n    assert 1 + 1 == 2" > tests/test_main.py
+
+# README
 
 echo "# $project_name" > README.md
 
-# Create .gitignore
+# =====================
+# .gitignore Generation
+# =====================
 cat <<EOL > .gitignore
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -43,12 +95,124 @@ dist/
 poetry.lock
 EOL
 
-# Initialize Git repository if selected
+# =====================
+# GitHub Actions CI/CD
+# =====================
+mkdir -p .github/workflows
+cat <<EOL > .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install
+      - name: Run linters
+        run: |
+          poetry run black --check .
+          poetry run isort --check-only .
+          poetry run flake8 .
+          poetry run mypy .
+      - name: Run tests
+        run: |
+          poetry run pytest
+EOL
+
+# =====================
+# License Generation
+# =====================
+if [ "$license_choice" = "MIT" ]; then
+  cat <<EOL > LICENSE
+MIT License
+
+Copyright (c) $(date +%Y) $USER
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+...
+EOL
+
+elif [ "$license_choice" = "Apache-2.0" ]; then
+  cat <<EOL > LICENSE
+Apache License 2.0
+
+Copyright (c) $(date +%Y) $USER
+
+Licensed under the Apache License, Version 2.0 (the "License");
+...
+EOL
+fi
+
+# =====================
+# Git Initialization (Optional)
+# =====================
 if [ "$init_git" = "y" ] || [ "$init_git" = "Y" ]; then
   git init
   git add .
   git commit -m "Initial commit"
 fi
 
-# Display success message
+# =====================
+# Pre-commit Hooks Setup
+# =====================
+cat <<EOL > .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/psf/black
+    rev: 25.1.0
+    hooks:
+      - id: black
+
+  - repo: https://github.com/pre-commit/mirrors-isort
+    rev: v6.0.0
+    hooks:
+      - id: isort
+
+  - repo: https://github.com/pycqa/flake8
+    rev: v7.1.1
+    hooks:
+      - id: flake8
+EOL
+
+poetry run pre-commit install
+
+# =====================
+# Makefile for Common Tasks
+# =====================
+cat <<EOL > Makefile
+install:
+	poetry install
+
+format:
+	poetry run black .
+	poetry run isort .
+
+lint:
+	poetry run flake8 .
+	poetry run mypy .
+
+test:
+	poetry run pytest
+
+type-check:
+	poetry run mypy .
+EOL
+
+# =====================
+# Final Message
+# =====================
 echo "✅ Python project '$project_name' initialized successfully!"
