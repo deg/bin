@@ -66,7 +66,9 @@ cd "$project_name" || exit
 # Poetry Project Setup
 poetry init --no-interaction --name "$project_name" --python="^$python_version"
 poetry env use python$python_version
-poetry add --dev pyright black isort flake8 pytest mypy coverage pre-commit
+poetry add --dev mypy pre-commit pyright pytest pytest-cov ruff
+# for Emacs
+poetry add --dev black ipython
 
 # Pre-configured pyproject.toml
 cat <<EOL >> pyproject.toml
@@ -92,30 +94,58 @@ testpaths = ["tests"]
 EOL
 
 # Sample Python Files
-echo "def main():\n    print(\"Hello, World!\")" > main.py
-echo "def test_example():\n    assert 1 + 1 == 2" > tests/test_main.py
 
 echo "# $project_name" > README.md
 
+cat <<EOF > main.py
+def main():
+    print("Hello, World!")
+EOF
+
+cat <<EOF > tests/test_main.py
+def test_example():
+    assert 1 + 1 == 2"
+EOF
+
+
 # .gitignore Generation
 cat <<EOL > .gitignore
-# Byte-compiled / optimized / DLL files
-__pycache__/
+# Python
+*.class
+*.egg
+*.egg-info/
+*.log
+*.pdb
 *.py[cod]
-*$py.class
-
-# Virtual environments
-.venv/
-
-# Distribution / packaging
+*.pyd
+*.pyo
+.coverage
+__pycache__/
 build/
 dist/
-*.egg-info/
+html/cov/
 
-# Poetry
-poetry.lock
-.coverage
-htmlcov/
+# Virtual Environments
+.venv/
+
+# Jupyter Notebooks (if any are used later)
+.ipynb_checkpoints
+
+# VS Code Settings
+# .vscode/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Media Files (optional - if you don’t want to track large video files)
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# DeepFace Cached Models
+# ~/.deepface/
 EOL
 
 # Optional Docker Setup
@@ -252,25 +282,78 @@ poetry run pre-commit install
 
 # Makefile
 cat <<EOL > Makefile
+# Use Bash for shell commands
+SHELL := /bin/bash
+
+# Project Name
+PROJECT_NAME := media-toys
+
+.DEFAULT_GOAL := help
+
+# Show this help message
+.PHONY: help
+help:
+	@echo -e "\033[1;34mUsage:\033[0m make [target]"
+	@echo ""
+	@echo -e "\033[1;36mTargets:\033[0m"
+	@awk '/^[a-zA-Z\-\_0-9]+:/ { \
+	    helpMessage = match(lastComment, /^# (.*)/); \
+	    helpCommand = $$1; sub(/:$$/, "", helpCommand); \
+	    if (helpMessage) { \
+	        printf "  \033[1;32m%-20s\033[0m \033[0;37m%s\033[0m\n", helpCommand, substr(lastComment, RSTART + 2, RLENGTH - 2); \
+	    } else { \
+	        printf "  \033[1;32m%-20s\033[0m \033[0;33m??? [No description]\033[0m\n", helpCommand; \
+	    } \
+	    lastComment = ""; \
+	} \
+	/^# / { \
+	    lastComment = $$0; \
+	} \
+	/^\.PHONY:/ { \
+	    next; \
+	}' $(MAKEFILE_LIST) | sort
+	@echo ""
+
+
+# Sync dependencies, updating poetry.lock and .venv
+.PHONY: update
+update:
+	poetry update
+
+# Install dependencies from poetry.lock
+.PHONY: install
 install:
+	poetry lock --no-update
 	poetry install
 
-format:
-	poetry run black .
-	poetry run isort .
 
+# List all outdated dependencies (direct dependencies only)
+.PHONY: outdated
+outdated:
+	poetry show --outdated --top-level
+
+# List all outdated dependencies (including transitive dependencies)
+.PHONY: outdated-all
+outdated-all:
+	poetry show --outdated
+
+# Lint all files (fails on errors)
+.PHONY: lint
 lint:
-	poetry run flake8 .
-	poetry run mypy .
+	@poetry run ruff check . || lint_failed=1
+	@poetry run pyright || lint_failed=1
+	@poetry run mypy . || lint_failed=1
+	@exit $${lint_failed:-0}
 
+# Run tests
+.PHONY: test
 test:
-	poetry run pytest
+	poetry run pytest --maxfail=1 --disable-warnings
 
+# Run test coverage (with 80% minimum threshold)
+.PHONY: coverage
 coverage:
-	poetry run pytest --cov=.
-
-type-check:
-	poetry run mypy .
+	poetry run pytest --cov=. --cov-fail-under=80
 EOL
 
 # Optional VS Code Workspace Settings
