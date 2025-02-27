@@ -71,6 +71,9 @@ poetry add --dev mypy pre-commit pyright pytest pytest-cov ruff
 # for Emacs
 poetry add --dev black ipython
 
+# Lock in precise dependencies
+sed -i '' 's/"\^/"/g' pyproject.toml
+
 # Pre-configured pyproject.toml
 cat <<EOL >> pyproject.toml
 
@@ -115,7 +118,7 @@ def main() -> None:
     print(message)  # "Hello, World!"
 
 
-if __name__ == "__main__": # pragma: no cover
+if __name__ == "__main__":  # pragma: no cover
     main()
 EOF
 
@@ -428,24 +431,20 @@ repos:
     rev: 25.1.0
     hooks:
       - id: black
-  - repo: https://github.com/pre-commit/mirrors-isort
-    rev: v6.0.0
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.12.0
     hooks:
       - id: isort
   - repo: https://github.com/pycqa/flake8
-    rev: v7.1.1
+    rev: 7.1.1
     hooks:
       - id: flake8
 EOL
 
   git init
+  make setup-dev-env
   git add .
-  git commit -m "Initial commit"
-
-  # Pre-commit Hooks Setup
-  poetry run pre-commit install
-
+  git commit -m "Initial commit - built with init_python_project"
 fi
-
 
 echo "✅ Python project '$project_name' initialized successfully!"
