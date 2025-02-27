@@ -65,9 +65,9 @@ mkdir -p "$project_name"/src/"$project_name"/utils
 cd "$project_name" || exit
 
 # Poetry Project Setup
-poetry init --no-interaction --name "$project_name" --python=">=$python_version"
+poetry init --no-interaction --name "$project_name" --python=">=$python_version,<4.0"
 poetry env use python$python_version
-poetry add --dev mypy pre-commit pyright pytest pytest-cov ruff
+poetry add --dev gitingest mypy pre-commit pyright pytest pytest-cov ruff
 # for Emacs
 poetry add --dev black ipython
 
@@ -316,6 +316,12 @@ test:
 .PHONY: coverage
 coverage:
 	poetry run pytest --cov=. --cov-report=term-missing --cov-fail-under=80
+
+
+# Generate an LLM-ready copy of this repo
+.PHONY: as-llm-input
+as-llm-input:
+	poetry run gitingest
 
 
 # Run the application
