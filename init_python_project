@@ -61,10 +61,11 @@ docker_choice=$(gum choose "Yes" "No" --header="Do you want to include Docker su
 
 # Create project directory
 mkdir -p "$project_name"/tests
+mkdir -p "$project_name"/src/"$project_name"/utils
 cd "$project_name" || exit
 
 # Poetry Project Setup
-poetry init --no-interaction --name "$project_name" --python="^$python_version"
+poetry init --no-interaction --name "$project_name" --python=">=$python_version"
 poetry env use python$python_version
 poetry add --dev mypy pre-commit pyright pytest pytest-cov ruff
 # for Emacs
@@ -72,6 +73,9 @@ poetry add --dev black ipython
 
 # Pre-configured pyproject.toml
 cat <<EOL >> pyproject.toml
+
+[tool.poetry.scripts]
+$project_name = "src.$project_name.main:main"
 
 [tool.black]
 line-length = 88
@@ -97,56 +101,58 @@ EOL
 
 echo "# $project_name" > README.md
 
-cat <<EOF > main.py
-def main():
-    print("Hello, World!")
+cat <<EOF > src/"$project_name"/__init__.py
+# This file is intentionally left blank.
 EOF
+
+cat <<EOF > src/"$project_name"/main.py
+from blogscraper.utils.helpers import greet
+
+
+def main() -> None:
+    name = "World"
+    message = greet(name)
+    print(message)  # "Hello, World!"
+
+
+if __name__ == "__main__": # pragma: no cover
+    main()
+EOF
+
+cat <<EOF > src/"$project_name"/utils/__init__.py
+# This file is intentionally left blank.
+EOF
+
+cat <<EOF > src/"$project_name"/utils/helpers.py
+def greet(name: str) -> str:
+    return f"Hello, {name}!"
+EOF
+
 
 cat <<EOF > tests/test_main.py
-def test_example():
-    assert 1 + 1 == 2"
+from pytest import CaptureFixture
+
+from blogscraper.main import main
+
+
+def test_example() -> None:
+    assert 1 + 1 == 2
+
+
+def test_main(capsys: CaptureFixture[str]) -> None:
+    main()
+    captured = capsys.readouterr()
+    assert "Hello, World!" in captured.out
 EOF
 
+cat <<EOF > tests/test_helpers.py
+from blogscraper.utils.helpers import greet
 
-# .gitignore Generation
-cat <<EOL > .gitignore
-# Python
-*.class
-*.egg
-*.egg-info/
-*.log
-*.pdb
-*.py[cod]
-*.pyd
-*.pyo
-.coverage
-__pycache__/
-build/
-dist/
-html/cov/
 
-# Virtual Environments
-.venv/
-
-# Jupyter Notebooks (if any are used later)
-.ipynb_checkpoints
-
-# VS Code Settings
-# .vscode/
-
-# OS-specific files
-.DS_Store
-Thumbs.db
-
-# Media Files (optional - if you don’t want to track large video files)
-*.mp4
-*.mov
-*.avi
-*.mkv
-
-# DeepFace Cached Models
-# ~/.deepface/
-EOL
+def test_greet() -> None:
+    assert greet("Alice") == "Hello, Alice!"
+    assert greet("Bob") == "Hello, Bob!"
+EOF
 
 # Optional Docker Setup
 if [ "$docker_choice" = "Yes" ]; then
@@ -168,43 +174,6 @@ services:
     command: poetry run python main.py
 EOL
 fi
-
-# GitHub Actions CI/CD
-mkdir -p .github/workflows
-cat <<EOL > .github/workflows/ci.yml
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '$python_version'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install poetry
-          poetry install
-      - name: Run linters
-        run: |
-          poetry run black --check .
-          poetry run isort --check-only .
-          poetry run flake8 .
-          poetry run mypy .
-      - name: Run tests with coverage
-        run: |
-          poetry run pytest --cov=.
-      - name: Upload coverage report
-        uses: codecov/codecov-action@v3
-EOL
 
 # License Generation
 author_name=$(git config user.name)
@@ -254,32 +223,6 @@ limitations under the License.
 EOL
 fi
 
-# Git Initialization
-if [ "$init_git" = "Yes" ]; then
-  git init
-  git add .
-  git commit -m "Initial commit"
-fi
-
-# Pre-commit Hooks Setup
-cat <<EOL > .pre-commit-config.yaml
-repos:
-  - repo: https://github.com/psf/black
-    rev: 25.1.0
-    hooks:
-      - id: black
-  - repo: https://github.com/pre-commit/mirrors-isort
-    rev: v6.0.0
-    hooks:
-      - id: isort
-  - repo: https://github.com/pycqa/flake8
-    rev: v7.1.1
-    hooks:
-      - id: flake8
-EOL
-
-poetry run pre-commit install
-
 # Makefile
 cat <<EOL > Makefile
 # Use Bash for shell commands
@@ -317,7 +260,7 @@ help:
 
 # Setup the development environment
 .PHONY: setup-dev-env
-setup-dev-env: install lint
+setup-dev-env: update install lint
 	@echo "🚀 Setting up Git hooks..."
 	poetry run pre-commit install
 	@if [ -f .git/hooks/pre-commit ]; then chmod +x .git/hooks/pre-commit; fi
@@ -354,7 +297,7 @@ lint:
 	@echo "🔍 Running Ruff..."
 	@poetry run ruff check . || lint_failed=1
 	@echo "🔍 Running Pyright..."
-	@poetry run pyright || lint_failed=1
+	@poetry run pyright . || lint_failed=1
 	@echo "🔍 Running Mypy..."
 	@poetry run mypy . || lint_failed=1
 	@exit \$\${lint_failed:-0}
@@ -369,7 +312,21 @@ test:
 # Run test coverage (with 80% minimum threshold)
 .PHONY: coverage
 coverage:
-	poetry run pytest --cov=. --cov-fail-under=80
+	poetry run pytest --cov=. --cov-report=term-missing --cov-fail-under=80
+
+
+# Run the application
+.PHONY: run
+run:
+	@echo "🚀 Running the application..."
+	poetry run python -m blogscraper.main
+
+
+# Debug the application with PDB
+.PHONY: debug
+debug:
+	@echo "🐞 Running the application in debug mode..."
+	poetry run python -m pdb -m blogscraper.main
 EOL
 
 # Optional VS Code Workspace Settings
@@ -384,5 +341,111 @@ cat <<EOL > .vscode/settings.json
   "python.testing.pytestEnabled": true
 }
 EOL
+
+# Git Initialization
+if [ "$init_git" = "Yes" ]; then
+
+  # .gitignore Generation
+  cat <<EOL > .gitignore
+# Python
+*.class
+*.egg
+*.egg-info/
+*.log
+*.pdb
+*.py[cod]
+*.pyd
+*.pyo
+.coverage
+__pycache__/
+build/
+dist/
+html/cov/
+
+# Virtual Environments
+.venv/
+
+# Jupyter Notebooks (if any are used later)
+.ipynb_checkpoints
+
+# VS Code Settings
+# .vscode/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Media Files (optional - if you don’t want to track large video files)
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# DeepFace Cached Models
+# ~/.deepface/
+EOL
+
+  # GitHub Actions CI/CD
+  mkdir -p .github/workflows
+  cat <<EOL > .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '$python_version'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install
+      - name: Run linters
+        run: |
+          poetry run black --check .
+          poetry run isort --check-only .
+          poetry run flake8 .
+          poetry run mypy .
+      - name: Run tests with coverage
+        run: |
+          poetry run pytest --cov=.
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+EOL
+
+  cat <<EOL > .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/psf/black
+    rev: 25.1.0
+    hooks:
+      - id: black
+  - repo: https://github.com/pre-commit/mirrors-isort
+    rev: v6.0.0
+    hooks:
+      - id: isort
+  - repo: https://github.com/pycqa/flake8
+    rev: v7.1.1
+    hooks:
+      - id: flake8
+EOL
+
+  git init
+  git add .
+  git commit -m "Initial commit"
+
+  # Pre-commit Hooks Setup
+  poetry run pre-commit install
+
+fi
+
 
 echo "✅ Python project '$project_name' initialized successfully!"
