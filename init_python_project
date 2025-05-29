@@ -67,7 +67,7 @@ cd "$project_name" || exit
 # Poetry Project Setup
 poetry init --no-interaction --name "$project_name" --python=">=$python_version,<4.0"
 poetry env use python$python_version
-poetry add --dev gitingest mypy pre-commit pyright pytest pytest-cov ruff
+poetry add --dev gitingest mypy pre-commit pyright pytest pytest-cov ruff isort
 # for Emacs
 poetry add --dev black ipython
 
@@ -109,7 +109,7 @@ cat <<EOF > src/"$project_name"/__init__.py
 EOF
 
 cat <<EOF > src/"$project_name"/main.py
-from blogscraper.utils.helpers import greet
+from $project_name.utils.helpers import greet
 
 
 def main() -> None:
@@ -135,7 +135,7 @@ EOF
 cat <<EOF > tests/test_main.py
 from pytest import CaptureFixture
 
-from blogscraper.main import main
+from $project_name.main import main
 
 
 def test_example() -> None:
@@ -149,7 +149,7 @@ def test_main(capsys: CaptureFixture[str]) -> None:
 EOF
 
 cat <<EOF > tests/test_helpers.py
-from blogscraper.utils.helpers import greet
+from $project_name.utils.helpers import greet
 
 
 def test_greet() -> None:
@@ -279,7 +279,7 @@ update:
 # Install dependencies from poetry.lock
 .PHONY: install
 install:
-	poetry install
+	poetry install --with dev
 
 
 # List all outdated dependencies (direct dependencies only)
@@ -299,6 +299,8 @@ outdated-all:
 lint:
 	@echo "🔍 Running Black..."
 	@poetry run black --check . || lint_failed=1
+	@echo "🔍 Running isort..."
+	@poetry run isort --check-only src  || lint_failed=1
 	@echo "🔍 Running Ruff..."
 	@poetry run ruff check . || lint_failed=1
 	@echo "🔍 Running Pyright..."
@@ -320,24 +322,18 @@ coverage:
 	poetry run pytest --cov=. --cov-report=term-missing --cov-fail-under=80
 
 
-# Generate an LLM-ready copy of this repo
-.PHONY: as-llm-input
-as-llm-input:
-	poetry run gitingest
-
-
 # Run the application
 .PHONY: run
 run:
 	@echo "🚀 Running the application..."
-	poetry run python -m blogscraper.main
+	poetry run python -m $project_name.main
 
 
 # Debug the application with PDB
 .PHONY: debug
 debug:
 	@echo "🐞 Running the application in debug mode..."
-	poetry run python -m pdb -m blogscraper.main
+	poetry run python -m pdb -m $project_name.main
 EOL
 
 # Optional VS Code Workspace Settings
@@ -419,12 +415,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install poetry
-          poetry install
+          poetry install --extras dev
       - name: Run linters
         run: |
           poetry run black --check .
           poetry run isort --check-only .
-          poetry run flake8 .
+          poetry run ruff check .
+          poetry run pyright .
           poetry run mypy .
       - name: Run tests with coverage
         run: |
