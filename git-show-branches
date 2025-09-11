@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+show_help() {
+  cat <<'EOF'
+git-show-branches
+=================
+
+List branches whose HEAD (tip) commit was authored by you.
+
+Usage:
+  git-show-branches <local|remote>
+
+Arguments:
+  local   Show local branches
+  remote  Show remote branches (e.g. origin/*)
+
+Behavior:
+- Matches by the single email set in your git config (user.email).
+- Prints branch name, date of the tip commit, and commit subject.
+- Sorted by date (most recent first).
+- Columns are neatly aligned.
+- Remote HEAD symbolic refs (like origin/HEAD) are skipped.
+
+Examples:
+  git-show-branches local
+  git-show-branches remote
+
+Options:
+  -h, --help    Show this help and exit
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  show_help
+  exit 1
+fi
+
+case "$1" in
+  -h|--help) show_help; exit 0 ;;
+  local|remote) MODE="$1" ;;
+  *) echo "Unknown option: $1" >&2; show_help; exit 1 ;;
+esac
+
+EMAIL="$(git config user.email || true)"
+if [[ -z "$EMAIL" ]]; then
+  echo "Error: git user.email is not set." >&2
+  exit 2
+fi
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+ME_LC="$(lower "$EMAIL")"
+
+{
+  printf "branch\tdate\tsubject\n"
+
+  if [[ "$MODE" == "local" ]]; then
+    git for-each-ref --format='%(refname:short)' refs/heads \
+    | while IFS= read -r BR; do
+        TIP="$(git rev-parse --verify "$BR^{commit}")" || continue
+        AE="$(git show -s --format=%ae "$TIP")"
+        if [[ "$(lower "$AE")" == "$ME_LC" ]]; then
+          DATE="$(git show -s --date=short --format=%ad "$TIP")"
+          SUBJ="$(git show -s --format=%s "$TIP")"
+          printf "%s\t%s\t%s\n" "$BR" "$DATE" "$SUBJ"
+        fi
+      done
+  else
+    git for-each-ref --format='%(refname:short)' refs/remotes \
+    | grep -v '/HEAD$' \
+    | while IFS= read -r BR; do
+        TIP="$(git rev-parse --verify "$BR^{commit}")" || continue
+        AE="$(git show -s --format=%ae "$TIP")"
+        if [[ "$(lower "$AE")" == "$ME_LC" ]]; then
+          DATE="$(git show -s --date=short --format=%ad "$TIP")"
+          SUBJ="$(git show -s --format=%s "$TIP")"
+          printf "%s\t%s\t%s\n" "$BR" "$DATE" "$SUBJ"
+        fi
+      done
+  fi
+} \
+| sort -k2,2r \
+| column -s $'\t' -t
