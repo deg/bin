@@ -279,6 +279,7 @@ update:
 # Install dependencies from poetry.lock
 .PHONY: install
 install:
+	poetry lock
 	poetry install --with dev
 
 
