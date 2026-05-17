@@ -1,4 +1,0 @@
-#!/bin/sh
-# Taken from https://gist.github.com/ryanbaldwin/6ec1fd64f6f69a19ddd4
-# and from page 12 of the book "Clojure Web Development Essentials", by Ryan Baldwin
-find . -print | sed -e 's;[^/]*/;|____;g;s;____|; |;g'
