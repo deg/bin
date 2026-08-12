@@ -289,7 +289,12 @@ def project_runs(block: list[tuple], min_run_min: int = 5) -> list[tuple]:
     out = []
     for start, end, tally in merged:
         ranked = sorted(tally.items(), key=lambda kv: -kv[1])
-        label = ranked[0][0] + (f" (+{len(ranked) - 1})" if len(ranked) > 1 else "")
+        # Name every project with its share, not just the dominant one: sibling repos
+        # of one client and a genuine two-client mix look identical otherwise, and
+        # telling them apart is the whole question when splitting a block into rows.
+        label = ", ".join(f"{p} {n}" for p, n in ranked[:4])
+        if len(ranked) > 4:
+            label += f", +{len(ranked) - 4} more"
         out.append((label, start, end, sum(tally.values())))
     return out
 
@@ -358,13 +363,21 @@ def main() -> int:
     else:
         since = (until - dt.timedelta(days=args.days)).replace(hour=0, minute=0, second=0, microsecond=0)
 
+    # Scan a little before the window so we can tell whether it opens mid-session --
+    # a block that began the previous evening and ran past midnight belongs to the
+    # earlier day, and the requested range alone can't reveal that.
+    scan = since - dt.timedelta(hours=3)
+
     events: list[tuple] = []
     if not args.no_claude:
-        events += collect_claude(since, until, args.tick)
+        events += collect_claude(scan, until, args.tick)
     if not args.no_git:
-        events += collect_git(since, until)
+        events += collect_git(scan, until)
     if not args.no_shell:
-        events += collect_shell(since, until)
+        events += collect_shell(scan, until)
+
+    before = sorted(e[0] for e in events if e[0] < since)
+    events = [e for e in events if e[0] >= since]
     # A resumed or forked session replays earlier turns, so the same prompt can
     # appear in more than one transcript at the same clock time.
     events = sorted(set(events), key=lambda e: e[0])
@@ -377,6 +390,14 @@ def main() -> int:
           f"({len(events)} events: {', '.join(f'{k}={v}' for k, v in sorted(counts.items())) or 'none'})")
     print(f"# times are local ({dt.datetime.now().astimezone().tzname()}); "
           f"'[active]' = Claude was working, one mark per {args.tick} min")
+
+    if before and (since - before[-1]).total_seconds() <= args.gap * 60:
+        run_start = before[0]
+        for a, b in zip(before, before[1:]):
+            if (b - a).total_seconds() > args.gap * 60:
+                run_start = b
+        print(f"# NOTE: work was already underway at the window start -- this session began "
+              f"{run_start:%a %H:%M}. The opening block is its tail, and may belong to the previous day.")
 
     if not events:
         print("# no activity found in this window")
