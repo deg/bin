@@ -1,0 +1,155 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["openpyxl"]
+# ///
+"""Read the real timesheet workbook: what's already logged, and the vocabulary to use.
+
+Companion to `worklog`. Where worklog says what I *did*, this says how I *record* it --
+the exact Client/Project/Type values the workbook's dropdowns allow, the descriptions I
+actually reuse, and which days are already entered so they don't get logged twice.
+
+Read-only. It never writes to the workbook.
+
+Usage:
+  timesheet-sheet                  # this month: entries, vocabulary, last logged day
+  timesheet-sheet --month 2026-07
+  timesheet-sheet --since 2026-08-11
+  timesheet-sheet --vocab-only     # just the allowed values and recent descriptions
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import sys
+from pathlib import Path
+
+import openpyxl
+
+ROOT = Path.home() / "mnt/riverside-new/degel/admin/Timesheets"
+SHEET = "ThisMonth"
+FIRST_ROW = 5  # rows 1-4 are headers, dropdown source ranges, and the monthly total
+
+
+def workbook_for(year: int, month: int) -> Path:
+    name = f"{year}-{month:02d}{dt.date(year, month, 1):%b}-DEG-timesheet.xlsx"
+    return ROOT / str(year) / name
+
+
+def as_time(v) -> str:
+    if isinstance(v, dt.timedelta):  # past-midnight end times are stored as a day offset
+        total = int(v.total_seconds() // 60)
+        return f"{total // 60:02d}:{total % 60:02d}"
+    if isinstance(v, (dt.time, dt.datetime)):
+        return f"{v.hour:02d}:{v.minute:02d}"
+    return "" if v is None else str(v)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--month", help="YYYY-MM (default: current month)")
+    ap.add_argument("--since", help="only show entries on/after this YYYY-MM-DD")
+    ap.add_argument("--vocab-only", action="store_true")
+    args = ap.parse_args()
+
+    today = dt.date.today()
+    if args.month:
+        try:
+            year, month = (int(x) for x in args.month.split("-"))
+        except ValueError:
+            sys.exit(f"timesheet-sheet: cannot parse --month {args.month!r}, want YYYY-MM")
+    else:
+        year, month = today.year, today.month
+
+    path = workbook_for(year, month)
+    if not path.exists():
+        sys.exit(f"timesheet-sheet: no workbook at {path}\n"
+                 f"(is the riverside share mounted? try: ls {ROOT})")
+
+    since = dt.date.fromisoformat(args.since) if args.since else None
+
+    # data_only: we want the computed Hours, not the formula behind it.
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    ws = wb[SHEET]
+
+    # Column L rightwards is a matrix: row 1 names the Client, row 2 the Project under
+    # it, one column per valid pair. Both are dropdown sources, so this is authoritative
+    # -- read it every run rather than hard-coding, since clients and projects get
+    # added and retired.
+    def header_row(row: int) -> list[str]:
+        cells = next(ws.iter_rows(min_row=row, max_row=row, min_col=12), ())
+        return [str(c.value).strip() if c.value is not None else "" for c in cells]
+
+    client_row, project_row = header_row(1), header_row(2)
+    allowed: dict[str, list[str]] = {}
+    for i, client in enumerate(client_row):
+        if not client or client[0].isdigit():
+            continue
+        proj = project_row[i] if i < len(project_row) else ""
+        allowed.setdefault(client, [])
+        if proj and not proj[0].isdigit() and proj not in allowed[client]:
+            allowed[client].append(proj)
+
+    rows, descs, types = [], {}, {}
+    for r in ws.iter_rows(min_row=FIRST_ROW, values_only=True):
+        date, start, end, hours, client, project, sub, typ, desc = r[1:10]
+        if not client or not isinstance(date, (dt.date, dt.datetime)):
+            continue
+        day = date.date() if isinstance(date, dt.datetime) else date
+        desc = (str(desc).strip() if desc else "")
+        if typ:
+            types[str(typ)] = types.get(str(typ), 0) + 1
+        if desc and desc != "(no work today)":
+            descs.setdefault((str(client), desc), 0)
+            descs[(str(client), desc)] += 1
+        # The Hours formula yields "**********" when End is before Start -- a data-entry
+        # error in the sheet, not a number. Keep the row visible; don't let it crash.
+        hours = hours if isinstance(hours, (int, float)) else None
+        rows.append((day, as_time(start), as_time(end), hours,
+                     str(client), str(project or ""), str(sub or ""), str(typ or ""), desc))
+
+    print(f"# {path.name}  ({len(rows)} entries)")
+    print("# Columns: Date | Start | End | Hours | Client | Project | Subproject | Type | Description")
+    print("# Valid Client / Project pairs (from the workbook's own dropdowns):")
+    for client, projs in allowed.items():
+        print(f"#   {client:12s} {', '.join(projs) if projs else '(no project)'}")
+    print(f"# Type values in use: {', '.join(f'{k} ({v})' for k, v in sorted(types.items(), key=lambda kv: -kv[1]))}")
+
+    # "(no work today)" rows are pre-filled for the whole month, so they say nothing
+    # about how far real logging has got.
+    worked = sorted({d for d, *rest in rows if rest[7] != "(no work today)"})
+    if worked:
+        print(f"# Real work logged on {len(worked)} days, {worked[0]:%d %b} .. {worked[-1]:%d %b}. "
+              f"LAST LOGGED DAY: {worked[-1]:%a %Y-%m-%d} -- days at or before this are already "
+              f"in the sheet; do not re-derive them without checking the entries below.")
+
+    print("\n## Descriptions already in use this month (reuse these exact phrases where the work matches)")
+    for (client, desc), n in sorted(descs.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {n:2d}x  {client:12s} {desc}")
+
+    if args.vocab_only:
+        return 0
+
+    shown = [r for r in rows if (since is None or r[0] >= since) and r[8] != "(no work today)"]
+    print(f"\n## Entries{f' since {since}' if since else ''}")
+    if not shown:
+        print("  (none)")
+        return 0
+    day = None
+    for d, start, end, hours, client, project, sub, typ, desc in shown:
+        if d != day:
+            day = d
+            print(f"\n{d:%a %d%b%y}")
+        who = client + (f"/{project}" if project else "")
+        hrs = f"{hours:5.2f}" if hours is not None else "  ???"
+        print(f"  {start}-{end}  {hrs}  {who:<18} {typ:<9} {desc}")
+    total = sum(r[3] for r in shown if r[3] is not None)
+    if any(r[3] is None for r in shown):
+        print("\n  NOTE: a row shows ??? hours -- its End is before its Start in the sheet.")
+    print(f"\n  total shown: {total:.2f}h")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
