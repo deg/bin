@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Harvest a raw, timestamped evidence stream of what I actually did, for timesheet
+reconstruction.
+
+This script does NOT make judgments. It emits sorted, deduped events from every
+source on this machine that records when I was working. Turning that stream into
+timesheet rows (session boundaries, client attribution, consolidation) is the job
+of the /timesheet slash command -- see ~/.claude/commands/timesheet.md.
+
+Sources:
+  claude  Claude Code session transcripts (~/.claude/projects/**/*.jsonl)
+          - user prompts (highest-signal: they say what I asked for)
+          - assistant-activity heartbeats, bucketed, so idle gaps are visible
+  git     commits authored by me across my repos (auto-discovered)
+  shell   ~/.zsh_history (extended format, captures work outside Claude)
+
+Usage:
+  worklog                      # last 2 days
+  worklog --days 5
+  worklog --since 2026-08-05 --until 2026-08-07
+  worklog --no-shell --tick 10
+  worklog --sessions           # collapsed activity blocks instead of raw events
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+AUTHOR_EMAIL = "deg@degel.com"
+
+CLAUDE_PROJECTS = HOME / ".claude" / "projects"
+ZSH_HISTORY = HOME / ".zsh_history"
+
+# Where to look for my repos. Only maxdepth-3 below each root.
+REPO_ROOTS = [HOME / "Documents", HOME / "core-personal-files", HOME / "bin", HOME / ".emacs.d"]
+
+# Repos that are not my work: upstream clones, archives, installed packages.
+REPO_EXCLUDE = re.compile(r"/(mirror|_old_computer_|elpa|node_modules|\.venv|vendor)/")
+
+# Shell noise: navigation and inspection commands say nothing about what I was building.
+SHELL_NOISE = re.compile(
+    r"^\s*(ls|ll|cd|pwd|clear|exit|history|which|man|echo|cat|less|more|head|tail|"
+    r"bg|fg|jobs|open|say|date|df|du|top|htop|ps)\b"
+)
+
+
+def local(ts_utc: str) -> dt.datetime | None:
+    """Parse an ISO-8601 UTC timestamp from a transcript into local time."""
+    try:
+        return (
+            dt.datetime.fromisoformat(ts_utc.replace("Z", "+00:00"))
+            .astimezone()
+            .replace(tzinfo=None)
+        )
+    except (ValueError, AttributeError):
+        return None
+
+
+def proj_label(cwd: str) -> str:
+    """Shorten a working directory to a stable project label.
+
+    Collapses to the project root: a cwd deep inside a repo (backend/, elpa/foo/)
+    is the same project as the repo itself, and splitting them fragments the
+    activity blocks.
+    """
+    if not cwd:
+        return "?"
+    p = cwd.replace(str(HOME), "~")
+    for prefix in ("~/Documents/", "~/"):
+        if p.startswith(prefix):
+            p = p[len(prefix) :] or "~"
+            break
+    p = re.sub(r"/(elpa|node_modules|\.venv)/.*$", "", p)
+    parts = p.split("/")
+    # Two levels is the natural project grain here: degel/miluim, marketbuzzr/nutshell-mvp.
+    return "/".join(parts[:2]) if len(parts) > 2 else p
+
+
+# Prompt text that says nothing about what I was doing.
+BOILERPLATE = re.compile(
+    r"^(\[Image[:\s]|\[Request interrupted|This session is being continued|"
+    r"Caveat: The messages below|Testing connection|"
+    r"[0-9a-f]{12,}\s+toolu_)", re.I  # background-task completion notices, not me typing
+)
+
+
+def clean(text: str, limit: int = 220) -> str:
+    """Flatten a prompt to one line, dropping injected context blocks.
+
+    A typed `/start-task` arrives in the transcript as the command's whole expanded
+    body, which is identical every time and would otherwise crowd out real prompts.
+    Collapse those back to the command name.
+    """
+    m = re.search(r"<command-name>\s*/?([\w-]+)", text)
+    cmd = m.group(1) if m else None
+    text = re.sub(r"<(system-reminder|command-[a-z-]+|local-command[^>]*)>.*?</\1>", " ", text, flags=re.S)
+    text = re.sub(r"<[^>]{1,40}>", " ", text)
+    text = " ".join(text.split())
+    if cmd:
+        text = f"/{cmd} {text}".strip()
+    elif text.startswith("**MANDATORY: Under NO circumstances"):
+        text = "/start-task"  # older transcripts inlined the body with no wrapper
+    if BOILERPLATE.match(text):
+        return ""
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def collect_claude(since: dt.datetime, until: dt.datetime, tick_min: int) -> list[tuple]:
+    """User prompts plus bucketed assistant-activity heartbeats, per session."""
+    events: list[tuple] = []
+    if not CLAUDE_PROJECTS.is_dir():
+        return events
+
+    # Top-level *.jsonl only: files under a session subdirectory are subagent
+    # transcripts, and counting them would double-count the same wall-clock time.
+    for f in CLAUDE_PROJECTS.glob("*/*.jsonl"):
+        if dt.datetime.fromtimestamp(f.stat().st_mtime) < since:
+            continue
+        ticks: dict[tuple, str] = {}
+        try:
+            fh = f.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = d.get("type")
+                if kind not in ("user", "assistant"):
+                    continue
+                when = local(d.get("timestamp", ""))
+                if when is None or not (since <= when <= until):
+                    continue
+                proj = proj_label(d.get("cwd", ""))
+
+                if kind == "assistant":
+                    bucket = when.replace(
+                        minute=when.minute - when.minute % tick_min, second=0, microsecond=0
+                    )
+                    ticks.setdefault((bucket, proj), f.stem[:8])
+                    continue
+
+                if d.get("userType") != "external":
+                    continue  # tool results and synthetic turns, not me typing
+                content = (d.get("message") or {}).get("content")
+                if isinstance(content, list):
+                    parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    text = " ".join(parts)
+                else:
+                    text = content if isinstance(content, str) else ""
+                text = clean(text)
+                if text:
+                    events.append((when, "claude", proj, f"prompt: {text}"))
+
+        for (bucket, proj), sess in ticks.items():
+            events.append((bucket, "claude", proj, f"[active {sess}]"))
+    return events
+
+
+def discover_repos() -> list[Path]:
+    repos = []
+    for root in REPO_ROOTS:
+        if not root.is_dir():
+            continue
+        try:
+            out = subprocess.run(
+                ["find", str(root), "-maxdepth", "3", "-name", ".git"],
+                capture_output=True, text=True, timeout=60,
+            ).stdout
+        except (subprocess.SubprocessError, OSError):
+            continue
+        for line in out.splitlines():
+            if line and not REPO_EXCLUDE.search(line):
+                repos.append(Path(line).parent)
+    if (HOME / ".git").is_dir():
+        repos.append(HOME)
+    return sorted(set(repos))
+
+
+def collect_git(since: dt.datetime, until: dt.datetime) -> list[tuple]:
+    """Commits I authored, across every branch, in every repo of mine."""
+    events = []
+    for repo in discover_repos():
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo), "log", "--all", "--no-merges",
+                 f"--author={AUTHOR_EMAIL}",
+                 f"--since={since:%Y-%m-%d %H:%M}", f"--until={until:%Y-%m-%d %H:%M}",
+                 "--date=format:%Y-%m-%dT%H:%M:%S", "--pretty=%ad|%h|%s"],
+                capture_output=True, text=True, timeout=30,
+            ).stdout
+        except (subprocess.SubprocessError, OSError):
+            continue
+        for line in out.splitlines():
+            when_s, _, rest = line.partition("|")
+            sha, _, subject = rest.partition("|")
+            try:
+                when = dt.datetime.fromisoformat(when_s)
+            except ValueError:
+                continue
+            events.append((when, "git", proj_label(str(repo)), f"{sha} {subject[:180]}"))
+    return events
+
+
+def collect_shell(since: dt.datetime, until: dt.datetime) -> list[tuple]:
+    """Timestamped zsh history -- the only record of work done outside Claude."""
+    events = []
+    if not ZSH_HISTORY.exists():
+        return events
+    pat = re.compile(r"^: (\d+):\d+;(.*)$")
+    with ZSH_HISTORY.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = pat.match(line)
+            if not m:
+                continue
+            when = dt.datetime.fromtimestamp(int(m.group(1)))
+            if not (since <= when <= until):
+                continue
+            cmd = m.group(2).strip()
+            if not cmd or SHELL_NOISE.match(cmd):
+                continue
+            events.append((when, "shell", "-", cmd[:180]))
+    return events
+
+
+def drop_command_bodies(events: list[tuple]) -> list[tuple]:
+    """Some transcripts record a slash command twice: once as `/name`, once as the
+    command's whole expanded body. Where both land in the same minute and project,
+    keep the short one."""
+    marked = {
+        (when.replace(second=0), proj)
+        for when, src, proj, text in events
+        if src == "claude" and re.match(r"^prompt: /\w", text)
+    }
+    return [
+        e for e in events
+        if not (
+            e[1] == "claude"
+            and e[3].startswith("prompt: ")
+            and len(e[3]) > 180
+            and not e[3].startswith("prompt: /")
+            and (e[0].replace(second=0), e[2]) in marked
+        )
+    ]
+
+
+def as_sessions(events: list[tuple], gap_min: int) -> list[str]:
+    """Collapse the stream into contiguous activity blocks, split on idle gaps."""
+    lines, block = [], []
+
+    def flush():
+        if not block:
+            return
+        start, end = block[0][0], block[-1][0]
+        projs = [p for p in {e[2] for e in block} if p not in ("-", "?")]
+        hours = (end - start).total_seconds() / 3600
+        prompts = list(dict.fromkeys(e[3][8:] for e in block if e[3].startswith("prompt:")))[:5]
+        lines.append(
+            f"{start:%a %Y-%m-%d %H:%M}-{end:%H:%M}  ({hours:4.2f}h, {len(block):3d} ev)  "
+            f"{', '.join(sorted(projs)) or '-'}"
+        )
+        lines.extend(f"      . {p[:150]}" for p in prompts)
+
+    for e in events:
+        if block and (e[0] - block[-1][0]).total_seconds() > gap_min * 60:
+            flush()
+            block = []
+        block.append(e)
+    flush()
+    return lines
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--days", type=int, default=2, help="lookback window in days (default 2)")
+    ap.add_argument("--since", help="start date/time, e.g. 2026-08-05 or '2026-08-05 06:00'")
+    ap.add_argument("--until", help="end date/time (default: now)")
+    ap.add_argument("--tick", type=int, default=5, help="assistant-activity bucket, minutes (default 5)")
+    ap.add_argument("--gap", type=int, default=30, help="idle gap that splits sessions, minutes (default 30)")
+    ap.add_argument("--sessions", action="store_true", help="collapsed blocks instead of raw events")
+    ap.add_argument("--no-shell", action="store_true")
+    ap.add_argument("--no-git", action="store_true")
+    ap.add_argument("--no-claude", action="store_true")
+    args = ap.parse_args()
+
+    def parse(s: str) -> dt.datetime:
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try:
+                return dt.datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        sys.exit(f"worklog: cannot parse date {s!r}")
+
+    until = parse(args.until) if args.until else dt.datetime.now()
+    if args.since:
+        since = parse(args.since)
+    else:
+        since = (until - dt.timedelta(days=args.days)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    events: list[tuple] = []
+    if not args.no_claude:
+        events += collect_claude(since, until, args.tick)
+    if not args.no_git:
+        events += collect_git(since, until)
+    if not args.no_shell:
+        events += collect_shell(since, until)
+    # A resumed or forked session replays earlier turns, so the same prompt can
+    # appear in more than one transcript at the same clock time.
+    events = sorted(set(events), key=lambda e: e[0])
+    events = drop_command_bodies(events)
+
+    counts: dict[str, int] = {}
+    for e in events:
+        counts[e[1]] = counts.get(e[1], 0) + 1
+    print(f"# worklog {since:%a %Y-%m-%d %H:%M} .. {until:%a %Y-%m-%d %H:%M}   "
+          f"({len(events)} events: {', '.join(f'{k}={v}' for k, v in sorted(counts.items())) or 'none'})")
+    print(f"# times are local ({dt.datetime.now().astimezone().tzname()}); "
+          f"'[active]' = Claude was working, one mark per {args.tick} min")
+
+    if not events:
+        print("# no activity found in this window")
+        return 0
+
+    if args.sessions:
+        print(f"# collapsed into blocks, split on gaps > {args.gap} min")
+        for line in as_sessions(events, args.gap):
+            print(line)
+        return 0
+
+    day = None
+    for when, src, proj, text in events:
+        if when.date() != day:
+            day = when.date()
+            print(f"\n## {when:%A %Y-%m-%d}")
+        print(f"{when:%H:%M}  {src:<6} {proj:<34} {text}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
