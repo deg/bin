@@ -254,6 +254,46 @@ def drop_command_bodies(events: list[tuple]) -> list[tuple]:
     ]
 
 
+def project_runs(block: list[tuple], min_run_min: int = 5) -> list[tuple]:
+    """Segment a block into contiguous single-project stretches.
+
+    A block that interleaves two projects has to become consecutive, non-overlapping
+    timesheet rows, so the split points matter more than the set of projects present.
+    Stretches shorter than min_run_min are absorbed into their neighbour rather than
+    fragmenting the block into unbillable slivers.
+    """
+    runs: list[list] = []  # [start, end, {proj: event_count}]
+    for when, _src, proj, _text in block:
+        if proj in ("-", "?"):
+            continue  # shell events carry no project; they inherit the surrounding run
+        if runs and proj in runs[-1][2]:
+            runs[-1][1] = when
+            runs[-1][2][proj] += 1
+        else:
+            runs.append([when, when, {proj: 1}])
+
+    merged: list[list] = []
+    for start, end, tally in runs:
+        short = (end - start).total_seconds() < min_run_min * 60
+        if merged and (short or set(tally) & set(merged[-1][2])):
+            merged[-1][1] = max(merged[-1][1], end)
+            for p, n in tally.items():
+                merged[-1][2][p] = merged[-1][2].get(p, 0) + n
+        else:
+            merged.append([start, end, dict(tally)])
+
+    if merged:  # a block's first/last events may be project-less shell commands
+        merged[0][0] = min(merged[0][0], block[0][0])
+        merged[-1][1] = max(merged[-1][1], block[-1][0])
+
+    out = []
+    for start, end, tally in merged:
+        ranked = sorted(tally.items(), key=lambda kv: -kv[1])
+        label = ranked[0][0] + (f" (+{len(ranked) - 1})" if len(ranked) > 1 else "")
+        out.append((label, start, end, sum(tally.values())))
+    return out
+
+
 def as_sessions(events: list[tuple], gap_min: int) -> list[str]:
     """Collapse the stream into contiguous activity blocks, split on idle gaps."""
     lines, block = [], []
@@ -262,14 +302,25 @@ def as_sessions(events: list[tuple], gap_min: int) -> list[str]:
         if not block:
             return
         start, end = block[0][0], block[-1][0]
-        projs = [p for p in {e[2] for e in block} if p not in ("-", "?")]
         hours = (end - start).total_seconds() / 3600
-        prompts = list(dict.fromkeys(e[3][8:] for e in block if e[3].startswith("prompt:")))[:5]
-        lines.append(
-            f"{start:%a %Y-%m-%d %H:%M}-{end:%H:%M}  ({hours:4.2f}h, {len(block):3d} ev)  "
-            f"{', '.join(sorted(projs)) or '-'}"
-        )
-        lines.extend(f"      . {p[:150]}" for p in prompts)
+        lines.append(f"{start:%a %Y-%m-%d %H:%M}-{end:%H:%M}  ({hours:4.2f}h, {len(block):3d} ev)")
+
+        runs = project_runs(block)
+        if runs:
+            lines.append("    where: " + "  ".join(
+                f"{s:%H:%M}-{e:%H:%M} {p}" for p, s, e, _n in runs))
+
+        # Commit subjects are the highest-signal one-liners available: they are already
+        # written as descriptions of the work, so they usually name the row outright.
+        commits = [f"{w:%H:%M} {p} {t}" for w, src, p, t in block if src == "git"]
+        lines.extend(f"    commit: {c[:150]}" for c in commits[:8])
+        if len(commits) > 8:
+            lines.append(f"    commit: ... and {len(commits) - 8} more")
+
+        prompts = list(dict.fromkeys(e[3][8:] for e in block if e[3].startswith("prompt:")))
+        lines.extend(f"    asked:  {p[:150]}" for p in prompts[:5])
+        if not commits and not prompts:
+            lines.append("    (no prompts or commits -- shell activity only)")
 
     for e in events:
         if block and (e[0] - block[-1][0]).total_seconds() > gap_min * 60:
