@@ -32,59 +32,117 @@ vm — disposable Ubuntu VMs via multipass
 Usage:
   vm <command> [args]
 
-Lifecycle:
-  new [name] [-i FILE]   Launch a VM with real specs + cloud-init, then shell in
-  reset [name]           Destroy and recreate from scratch (the core loop)
-  nuke [name] [--force]  Destroy permanently (delete --purge)
-  gc                     Reclaim disk from instances already deleted
+Lifecycle
+---------
+  new [name] [-i FILE]
+      Create a VM and shell into it. Refuses if <name> already exists, so it
+      can never clobber a box you are still using. Provisioning comes from the
+      cloud-init file; -i FILE uses a different one, --no-cloud-init skips it
+      for a bare Ubuntu.
 
-Daily use:
-  sh|shell [name]        Open a shell in the VM
-  run <name> <cmd...>    Run one command inside the VM
-  ls                     List instances, snapshots, and host disk headroom
-  ip [name]              Print the VM's IPv4 address
+  reset [name]
+      nuke + new under the same name -- the fastest route back to a known-clean
+      box, and the reason this script exists. Everything inside the VM is lost;
+      host directories you mounted are untouched.
+
+  nuke [name] [--force]
+      Permanently destroy the VM and its snapshots (delete --purge). Unlike a
+      bare `multipass delete` there is no undo and the disk is freed at once.
+      Refuses instances listed in VM_PROTECTED unless you pass --force.
+
+  gc
+      Free disk from instances sitting in the Deleted state after a bare
+      `multipass delete`. Never touches running or stopped instances.
+
+Daily use
+---------
+  sh|shell [name]
+      Interactive shell in the VM as user 'ubuntu'. Tries multipass first, then
+      falls back to plain ssh -- see "No route to host" below.
+
+  run <name> <cmd...>
+      Run one command in the VM and exit with its status, so it composes in
+      scripts and pipelines. Arguments are re-quoted before they cross, so
+      quotes and globs survive:  vm run box bash -c 'ls ~/*.log'
+
+  ls
+      Every instance with its state and IP, all snapshots, and how much room is
+      left on the host disk.
+
+  ip [name]
+      The VM's IPv4 address alone, for scripting:  curl http://$(vm ip):8000/
+
   mount <name> <dir> [target]
-                         Share a host directory into the VM (default target:
-                         /home/ubuntu/<basename>)
+      Share a host directory into the VM. Read-write, changes visible both ways
+      immediately, and it survives stop/start. This -- not snapshots -- is how
+      you keep work that matters: the files live on the host, so the VM stays
+      disposable.
+      [!] macOS withholds ~/Documents, ~/Desktop and ~/Downloads from the
+      multipass daemon. Mounting those attaches successfully but the directory
+      reads as EMPTY inside the VM, with no error. Granting Full Disk Access to
+      /Library/Application Support/com.canonical.multipass/bin/multipassd is
+      the likely fix.
 
-Persistence:
-  snap <name> [label]    Stop, snapshot, restart. Saves system state.
-  restore <name> <snap>  Stop, roll back to a snapshot, restart. DESTRUCTIVE:
-                         discards the instance's current state.
+Persistence
+-----------
+  snap <name> [label]
+      Checkpoint the VM's whole disk under a name you choose. multipass can
+      only snapshot a stopped instance, so this stops it, snapshots, and
+      restarts it if it had been running.
 
-Other:
-  gui                    Open Multipass.app, the graphical instance manager
-  help                   This text
+  restore <name> <snap>
+      Roll the VM back to a checkpoint, then restart it. DESTRUCTIVE: every
+      change made since that snapshot is discarded, and it does not stop to
+      ask. Snapshots capture installed system state; use mounts for files.
 
-Naming:
-  Commands that take [name] default to "scratch". Everything is disposable
-  unless you snapshot it or mount host directories into it.
+Other
+-----
+  gui
+      Open Multipass.app, Canonical's point-and-click instance manager. It
+      manages VMs -- it is NOT an Ubuntu desktop. These are headless server
+      images booted with no display device at all.
 
-Configuration (environment, or put in ~/.vmrc):
+  help
+      This text.
+
+Naming
+------
+  Commands taking [name] default to "scratch". Assume anything inside a VM is
+  gone on the next reset; keep what matters on the host via mount, or freeze a
+  known-good system state with snap.
+
+Configuration (environment, or ~/.vmrc)
+---------------------------------------
   VM_IMAGE=26.04     VM_CPUS=4       VM_MEM=8G      VM_DISK=40G
   VM_TIMEOUT=600     VM_DEFAULT_NAME=scratch
   VM_CLOUD_INIT=<path to cloud-init YAML>
   VM_SSH_KEY=~/.ssh/multipass_vm    (fallback key, see below)
   VM_PROTECTED="primary blissful-tamandua"
 
-Note on 'No route to host':
-  multipass's own client cannot open SSH sessions on this machine -- `multipass
-  shell` and `multipass exec` fail with "No route to host" for every instance,
-  including ones created long before this script. The daemon's SSH works fine
-  (launching and provisioning are unaffected), and the VMs answer on port 22
-  from the host, so this is a client-side fault, not a network one.
+  VM_TIMEOUT is generous because cloud-init runs apt on first boot; multipass's
+  own 5-minute default is not enough and fails looking like a hang.
+
+Note on 'No route to host'
+--------------------------
+  multipass's client cannot open SSH sessions on this machine: `multipass
+  shell` and `multipass exec` fail this way for every instance, including ones
+  created long before this script. The daemon's own SSH works (launching,
+  provisioning, mounts and snapshots are all unaffected) and the VMs answer on
+  port 22 from the host, so the fault is client-side, not network.
 
   `vm sh` and `vm run` therefore try multipass first and fall back to plain ssh
-  using VM_SSH_KEY, whose public half `vm new` installs via cloud-init. The
-  fallback only works for instances created after that was added -- for older
-  ones, `vm reset <name>` rebuilds them with the key in place.
+  with VM_SSH_KEY, whose public half `vm new` installs through cloud-init. That
+  fallback only reaches instances created after the key was added -- for older
+  ones, `vm reset <name>` rebuilds them with it in place.
 
-Examples:
+Examples
+--------
   vm new                          # 4-core / 8G / 40G Ubuntu 26.04 named "scratch"
   vm new ansible-test             # a second, differently-named box
-  vm mount scratch ~/Documents/degel/blogscraper
+  vm run scratch uname -a
+  vm mount scratch ~/Documents/degel/blogscraper   # but see [!] under mount
   vm snap scratch clean-base      # checkpoint before you break something
-  vm restore scratch clean-base   # go back
+  vm restore scratch clean-base   # go back to it
   vm reset                        # burn it down and start over
   vm nuke ansible-test
 EOF
