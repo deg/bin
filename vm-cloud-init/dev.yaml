@@ -1,0 +1,15 @@
+#cloud-config
+# Default provisioning for `vm new`. Keep this lean — every package here is
+# paid for on each launch. Override with: vm new -i /path/to/other.yaml
+package_update: true
+packages:
+  - build-essential
+  - ca-certificates
+  - curl
+  - git
+  - jq
+  - python3-pip
+  - ripgrep
+  - unzip
+runcmd:
+  - [ su, ubuntu, -c, "curl -LsSf https://astral.sh/uv/install.sh | sh" ]

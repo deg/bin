@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# vm — disposable Ubuntu VMs on top of multipass.
+#
+# The point of this wrapper is that multipass's defaults (1 CPU / 1G / 5G) are
+# far too small to be useful, and its two most valuable features — cloud-init
+# provisioning and --purge teardown — are the ones easiest to forget to type.
+
+[[ -f "$HOME/.vmrc" ]] && source "$HOME/.vmrc"
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+VM_IMAGE="${VM_IMAGE:-26.04}"
+VM_CPUS="${VM_CPUS:-4}"
+VM_MEM="${VM_MEM:-8G}"
+VM_DISK="${VM_DISK:-40G}"
+VM_DEFAULT_NAME="${VM_DEFAULT_NAME:-scratch}"
+VM_TIMEOUT="${VM_TIMEOUT:-600}"
+VM_CLOUD_INIT="${VM_CLOUD_INIT:-$SELF_DIR/vm-cloud-init/dev.yaml}"
+
+# Instances this tool refuses to destroy without --force. Long-lived VMs that
+# predate the disposable workflow live here so a stray `vm nuke` can't reap them.
+VM_PROTECTED="${VM_PROTECTED:-primary blissful-tamandua}"
+
+show_help() {
+  cat <<'EOF'
+vm — disposable Ubuntu VMs via multipass
+========================================
+
+Usage:
+  vm <command> [args]
+
+Lifecycle:
+  new [name] [-i FILE]   Launch a VM with real specs + cloud-init, then shell in
+  reset [name]           Destroy and recreate from scratch (the core loop)
+  nuke [name] [--force]  Destroy permanently (delete --purge)
+  gc                     Reclaim disk from instances already deleted
+
+Daily use:
+  sh|shell [name]        Open a shell (alias for `multipass shell`)
+  run <name> <cmd...>    Run one command inside the VM
+  ls                     List instances, snapshots, and host disk headroom
+  ip [name]              Print the VM's IPv4 address
+  mount <name> <dir> [target]
+                         Share a host directory into the VM (default target:
+                         /home/ubuntu/<basename>)
+
+Persistence:
+  snap <name> [label]    Stop, snapshot, restart. Saves system state.
+  restore <name> <snap>  Stop, roll back to a snapshot, restart. DESTRUCTIVE:
+                         discards the instance's current state.
+
+Other:
+  gui                    Open Multipass.app, the graphical instance manager
+  help                   This text
+
+Naming:
+  Commands that take [name] default to "scratch". Everything is disposable
+  unless you snapshot it or mount host directories into it.
+
+Configuration (environment, or put in ~/.vmrc):
+  VM_IMAGE=26.04     VM_CPUS=4       VM_MEM=8G      VM_DISK=40G
+  VM_TIMEOUT=600     VM_DEFAULT_NAME=scratch
+  VM_CLOUD_INIT=<path to cloud-init YAML>
+  VM_PROTECTED="primary blissful-tamandua"
+
+Examples:
+  vm new                          # 4-core / 8G / 40G Ubuntu 26.04 named "scratch"
+  vm new ansible-test             # a second, differently-named box
+  vm mount scratch ~/Documents/degel/blogscraper
+  vm snap scratch clean-base      # checkpoint before you break something
+  vm restore scratch clean-base   # go back
+  vm reset                        # burn it down and start over
+  vm nuke ansible-test
+EOF
+}
+
+die() { echo "vm: $*" >&2; exit 1; }
+
+need_multipass() {
+  command -v multipass >/dev/null 2>&1 \
+    || die "multipass not found. Install from https://multipass.run/"
+}
+
+exists() { multipass info "$1" >/dev/null 2>&1; }
+
+is_protected() {
+  local n="$1" p
+  for p in $VM_PROTECTED; do [[ "$n" == "$p" ]] && return 0; done
+  return 1
+}
+
+state_of() {
+  multipass info "$1" --format csv 2>/dev/null | awk -F, 'NR==2 {print $2}'
+}
+
+cmd_new() {
+  local name="" ci="$VM_CLOUD_INIT"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--cloud-init) ci="$2"; shift 2 ;;
+      --no-cloud-init) ci=""; shift ;;
+      -*) die "unknown option for new: $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  name="${name:-$VM_DEFAULT_NAME}"
+
+  exists "$name" && die "instance '$name' already exists. Use 'vm reset $name' or pick another name."
+
+  local args=( launch "$VM_IMAGE" -n "$name"
+               -c "$VM_CPUS" -m "$VM_MEM" -d "$VM_DISK"
+               --timeout "$VM_TIMEOUT" )
+  if [[ -n "$ci" ]]; then
+    [[ -f "$ci" ]] || die "cloud-init file not found: $ci"
+    args+=( --cloud-init "$ci" )
+    echo "Launching '$name' ($VM_IMAGE, ${VM_CPUS}c/${VM_MEM}/${VM_DISK}) with $(basename "$ci")..."
+  else
+    echo "Launching '$name' ($VM_IMAGE, ${VM_CPUS}c/${VM_MEM}/${VM_DISK}), no provisioning..."
+  fi
+  echo "First launch of a new release downloads an image; later ones are cached."
+
+  multipass "${args[@]}"
+  echo
+  multipass shell "$name"
+}
+
+cmd_nuke() {
+  local force=0 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      -*) die "unknown option for nuke: $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  name="${name:-$VM_DEFAULT_NAME}"
+
+  exists "$name" || { echo "vm: no instance '$name' — nothing to do."; return 0; }
+
+  if is_protected "$name" && [[ $force -eq 0 ]]; then
+    die "'$name' is protected (VM_PROTECTED). Re-run with --force if you really mean it."
+  fi
+
+  echo "Destroying '$name' permanently..."
+  multipass delete --purge "$name"
+  echo "Gone."
+}
+
+cmd_reset() {
+  local force=0 name="" passthru=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      -i|--cloud-init) passthru+=( -i "$2" ); shift 2 ;;
+      --no-cloud-init) passthru+=( --no-cloud-init ); shift ;;
+      -*) die "unknown option for reset: $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  name="${name:-$VM_DEFAULT_NAME}"
+
+  if exists "$name"; then
+    if is_protected "$name" && [[ $force -eq 0 ]]; then
+      die "'$name' is protected (VM_PROTECTED). Re-run with --force if you really mean it."
+    fi
+    echo "Destroying existing '$name'..."
+    multipass delete --purge "$name"
+  fi
+  cmd_new "$name" "${passthru[@]+"${passthru[@]}"}"
+}
+
+cmd_ls() {
+  multipass list
+  echo
+  echo "Snapshots:"
+  multipass list --snapshots 2>&1 | sed 's/^/  /'
+  echo
+  echo "Host disk:"
+  df -h /System/Volumes/Data | awk 'NR==2 {printf "  %s free of %s\n", $4, $2}'
+}
+
+cmd_snap() {
+  local name="${1:-}" label="${2:-}"
+  [[ -n "$name" ]] || die "usage: vm snap <name> [label]"
+  exists "$name" || die "no such instance: $name"
+
+  local was; was="$(state_of "$name")"
+  if [[ "$was" == "Running" ]]; then
+    echo "Stopping '$name' (multipass requires a stopped instance to snapshot)..."
+    multipass stop "$name"
+  fi
+
+  if [[ -n "$label" ]]; then
+    multipass snapshot "$name" -n "$label"
+  else
+    multipass snapshot "$name"
+  fi
+
+  if [[ "$was" == "Running" ]]; then
+    echo "Restarting '$name'..."
+    multipass start "$name"
+  fi
+}
+
+cmd_restore() {
+  local name="${1:-}" snap="${2:-}"
+  [[ -n "$name" && -n "$snap" ]] || die "usage: vm restore <name> <snapshot>   (see 'vm ls')"
+  exists "$name" || die "no such instance: $name"
+
+  echo "This DISCARDS the current state of '$name' and rolls back to '$snap'."
+  local was; was="$(state_of "$name")"
+  [[ "$was" == "Running" ]] && { echo "Stopping '$name'..."; multipass stop "$name"; }
+
+  multipass restore --destructive "$name.$snap"
+
+  if [[ "$was" == "Running" ]]; then
+    echo "Restarting '$name'..."
+    multipass start "$name"
+  fi
+}
+
+cmd_mount() {
+  local name="${1:-}" dir="${2:-}" target="${3:-}"
+  [[ -n "$name" && -n "$dir" ]] || die "usage: vm mount <name> <host-dir> [target]"
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+  exists "$name" || die "no such instance: $name"
+
+  local abs; abs="$(cd "$dir" && pwd)"
+  target="${target:-/home/ubuntu/$(basename "$abs")}"
+  multipass mount "$abs" "$name:$target"
+  echo "Mounted $abs -> $name:$target"
+}
+
+cmd_gc() {
+  echo "Purging instances already marked deleted..."
+  multipass purge
+  echo
+  cmd_ls
+}
+
+cmd_ip() {
+  local name="${1:-$VM_DEFAULT_NAME}"
+  exists "$name" || die "no such instance: $name"
+  multipass info "$name" --format csv | awk -F, 'NR==2 {print $3}'
+}
+
+cmd_gui() {
+  local app="/Library/Application Support/com.canonical.multipass/bin/Multipass.app"
+  [[ -d "$app" ]] || die "Multipass.app not found (it ships with the Canonical .pkg, not the brew cask)."
+  echo "Opening the multipass instance manager. Note: this manages VMs;"
+  echo "it is not an Ubuntu desktop — the images are headless server images."
+  open "$app"
+}
+
+need_multipass
+
+[[ $# -eq 0 ]] && { show_help; exit 1; }
+
+cmd="$1"; shift
+case "$cmd" in
+  new)            cmd_new "$@" ;;
+  reset)          cmd_reset "$@" ;;
+  nuke)           cmd_nuke "$@" ;;
+  gc)             cmd_gc "$@" ;;
+  sh|shell)       multipass shell "${1:-$VM_DEFAULT_NAME}" ;;
+  run)            [[ $# -ge 2 ]] || die "usage: vm run <name> <cmd...>"
+                  n="$1"; shift; multipass exec "$n" -- "$@" ;;
+  ls|list)        cmd_ls ;;
+  ip)             cmd_ip "$@" ;;
+  mount)          cmd_mount "$@" ;;
+  snap|snapshot)  cmd_snap "$@" ;;
+  restore)        cmd_restore "$@" ;;
+  gui)            cmd_gui ;;
+  -h|--help|help) show_help ;;
+  *)              echo "vm: unknown command '$cmd'" >&2; echo >&2; show_help >&2; exit 1 ;;
+esac
