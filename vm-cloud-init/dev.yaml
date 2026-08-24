@@ -13,3 +13,9 @@ packages:
   - unzip
 runcmd:
   - [ su, ubuntu, -c, "curl -LsSf https://astral.sh/uv/install.sh | sh" ]
+
+# Lets `vm sh` / `vm run` reach the VM with plain ssh when multipass's own
+# client cannot (see the "No route to host" note in vm's help). Dedicated
+# local-VM key: ~/.ssh/multipass_vm — not reused from any real host.
+ssh_authorized_keys:
+  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJirFSCsYWI+h8gFuNB142weqfkzsYTZF4JA/N+Ux4TA multipass-vm@deg-mac-2023

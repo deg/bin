@@ -18,6 +18,7 @@ VM_DISK="${VM_DISK:-40G}"
 VM_DEFAULT_NAME="${VM_DEFAULT_NAME:-scratch}"
 VM_TIMEOUT="${VM_TIMEOUT:-600}"
 VM_CLOUD_INIT="${VM_CLOUD_INIT:-$SELF_DIR/vm-cloud-init/dev.yaml}"
+VM_SSH_KEY="${VM_SSH_KEY:-$HOME/.ssh/multipass_vm}"
 
 # Instances this tool refuses to destroy without --force. Long-lived VMs that
 # predate the disposable workflow live here so a stray `vm nuke` can't reap them.
@@ -38,7 +39,7 @@ Lifecycle:
   gc                     Reclaim disk from instances already deleted
 
 Daily use:
-  sh|shell [name]        Open a shell (alias for `multipass shell`)
+  sh|shell [name]        Open a shell in the VM
   run <name> <cmd...>    Run one command inside the VM
   ls                     List instances, snapshots, and host disk headroom
   ip [name]              Print the VM's IPv4 address
@@ -63,7 +64,20 @@ Configuration (environment, or put in ~/.vmrc):
   VM_IMAGE=26.04     VM_CPUS=4       VM_MEM=8G      VM_DISK=40G
   VM_TIMEOUT=600     VM_DEFAULT_NAME=scratch
   VM_CLOUD_INIT=<path to cloud-init YAML>
+  VM_SSH_KEY=~/.ssh/multipass_vm    (fallback key, see below)
   VM_PROTECTED="primary blissful-tamandua"
+
+Note on 'No route to host':
+  multipass's own client cannot open SSH sessions on this machine -- `multipass
+  shell` and `multipass exec` fail with "No route to host" for every instance,
+  including ones created long before this script. The daemon's SSH works fine
+  (launching and provisioning are unaffected), and the VMs answer on port 22
+  from the host, so this is a client-side fault, not a network one.
+
+  `vm sh` and `vm run` therefore try multipass first and fall back to plain ssh
+  using VM_SSH_KEY, whose public half `vm new` installs via cloud-init. The
+  fallback only works for instances created after that was added -- for older
+  ones, `vm reset <name>` rebuilds them with the key in place.
 
 Examples:
   vm new                          # 4-core / 8G / 40G Ubuntu 26.04 named "scratch"
@@ -95,6 +109,47 @@ state_of() {
   multipass info "$1" --format csv 2>/dev/null | awk -F, 'NR==2 {print $2}'
 }
 
+# multipass's client SSH is broken on this host (see `vm help`). Try it anyway
+# -- it is the supported path and may be fixed -- then fall back to plain ssh
+# against the key cloud-init installed.
+ssh_target() {
+  local name="$1" ip
+  ip="$(cmd_ip "$name")" || return 1
+  [[ -n "$ip" ]] || return 1
+  printf 'ubuntu@%s' "$ip"
+}
+
+ssh_opts() {
+  printf '%s\n' -i "$VM_SSH_KEY" \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR -o ConnectTimeout=10
+}
+
+vm_connect() {
+  local name="$1"
+  multipass shell "$name" 2>/dev/null && return 0
+  [[ -f "$VM_SSH_KEY" ]] || die "multipass shell failed and no fallback key at $VM_SSH_KEY"
+  local target; target="$(ssh_target "$name")" \
+    || die "multipass shell failed and '$name' has no IP yet"
+  echo "(multipass shell failed; falling back to ssh $target)" >&2
+  local opts; IFS=$'\n' read -r -d '' -a opts < <(ssh_opts && printf '\0')
+  ssh "${opts[@]}" "$target"
+}
+
+vm_exec() {
+  local name="$1"; shift
+  multipass exec "$name" -- "$@" 2>/dev/null && return 0
+  [[ -f "$VM_SSH_KEY" ]] || die "multipass exec failed and no fallback key at $VM_SSH_KEY"
+  local target; target="$(ssh_target "$name")" \
+    || die "multipass exec failed and '$name' has no IP"
+  local opts; IFS=$'\n' read -r -d '' -a opts < <(ssh_opts && printf '\0')
+  # ssh flattens argv into one string for the remote shell, so re-quote each
+  # argument or anything with spaces/globs/quotes gets re-parsed remotely.
+  local remote="" a
+  for a in "$@"; do remote+="$(printf '%q ' "$a")"; done
+  ssh "${opts[@]}" "$target" "$remote"
+}
+
 cmd_new() {
   local name="" ci="$VM_CLOUD_INIT"
   while [[ $# -gt 0 ]]; do
@@ -123,7 +178,10 @@ cmd_new() {
 
   multipass "${args[@]}"
   echo
-  multipass shell "$name"
+  echo "Ready: $name at $(cmd_ip "$name")"
+  echo "Reconnect any time with: vm sh $name"
+  echo
+  vm_connect "$name" || true
 }
 
 cmd_nuke() {
@@ -264,9 +322,9 @@ case "$cmd" in
   reset)          cmd_reset "$@" ;;
   nuke)           cmd_nuke "$@" ;;
   gc)             cmd_gc "$@" ;;
-  sh|shell)       multipass shell "${1:-$VM_DEFAULT_NAME}" ;;
+  sh|shell)       vm_connect "${1:-$VM_DEFAULT_NAME}" ;;
   run)            [[ $# -ge 2 ]] || die "usage: vm run <name> <cmd...>"
-                  n="$1"; shift; multipass exec "$n" -- "$@" ;;
+                  n="$1"; shift; vm_exec "$n" "$@" ;;
   ls|list)        cmd_ls ;;
   ip)             cmd_ip "$@" ;;
   mount)          cmd_mount "$@" ;;
