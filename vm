@@ -20,6 +20,18 @@ VM_TIMEOUT="${VM_TIMEOUT:-600}"
 VM_CLOUD_INIT="${VM_CLOUD_INIT:-$SELF_DIR/vm-cloud-init/dev.yaml}"
 VM_SSH_KEY="${VM_SSH_KEY:-$HOME/.ssh/multipass_vm}"
 
+# Host directories auto-mounted by `vm new`, as space-separated <src>:<target>
+# pairs. A relative target lands under /home/ubuntu. Paths may not contain
+# spaces. Set to "" to launch with nothing shared.
+VM_MOUNTS="${VM_MOUNTS:-$HOME/Documents:host-documents}"
+
+# What `vm bootstrap` seeds a VM with, to satisfy setup-new-machine.sh's own
+# sanity check and let it clone over ssh. Deliberately ONE key, not all of
+# ~/.ssh -- that directory holds AWS/Azure/GCP credentials with no business
+# in a disposable VM.
+VM_BOOTSTRAP_KEY="${VM_BOOTSTRAP_KEY:-$HOME/.ssh/id_rsa_github}"
+VM_BOOTSTRAP_DIR="${VM_BOOTSTRAP_DIR:-$HOME/core-personal-files}"
+
 # Space-separated instances `vm nuke` and `vm reset` refuse to touch without
 # --force. Empty by default -- everything is disposable until you say otherwise.
 # Name any long-lived VM here (best set in ~/.vmrc) to shield it.
@@ -35,11 +47,12 @@ Usage:
 
 Lifecycle
 ---------
-  new [name] [-i FILE]
-      Create a VM and shell into it. Refuses if <name> already exists, so it
-      can never clobber a box you are still using. Provisioning comes from the
-      cloud-init file; -i FILE uses a different one, --no-cloud-init skips it
-      for a bare Ubuntu.
+  new [name] [-i FILE] [-b]
+      Create a VM, apply VM_MOUNTS, and shell into it. Refuses if <name>
+      already exists, so it can never clobber a box you are still using.
+      Provisioning comes from the cloud-init file; -i FILE uses a different
+      one, --no-cloud-init skips it for a bare Ubuntu. -b/--bootstrap also
+      seeds the box for setup-new-machine.sh (see `bootstrap`).
 
   reset [name]
       nuke + new under the same name -- the fastest route back to a known-clean
@@ -96,6 +109,21 @@ Persistence
       change made since that snapshot is discarded, and it does not stop to
       ask. Snapshots capture installed system state; use mounts for files.
 
+Bootstrapping a new-machine test
+--------------------------------
+  bootstrap [name]
+      Put a VM in the state setup-new-machine.sh expects, doing by command
+      what the new-machine flow does by hand: copy in VM_BOOTSTRAP_KEY, write
+      a minimal ~/.ssh/config pointing github at it, and copy
+      VM_BOOTSTRAP_DIR (core-personal-files, with its .git) into the VM. Then
+      run the script yourself -- it is interactive and makes real changes, so
+      it is deliberately never run for you.
+      Only ONE ssh key travels, not all of ~/.ssh: that directory holds AWS,
+      Azure and GCP credentials that have no business in a throwaway VM.
+      core-personal-files is COPIED rather than mounted on purpose -- the
+      script runs `git pull` and rewrites dotfiles in it, and a mount would
+      aim all of that at your host checkout.
+
 Other
 -----
   gui
@@ -119,6 +147,11 @@ Configuration (environment, or ~/.vmrc)
   VM_CLOUD_INIT=<path to cloud-init YAML>
   VM_SSH_KEY=~/.ssh/multipass_vm    (fallback key, see below)
   VM_PROTECTED=""       (space-separated names vm nuke/reset won't touch)
+  VM_MOUNTS="$HOME/Documents:host-documents"
+                        Space-separated <src>:<target> pairs mounted by
+                        `vm new`. Relative targets land under /home/ubuntu.
+  VM_BOOTSTRAP_KEY=~/.ssh/id_rsa_github
+  VM_BOOTSTRAP_DIR=~/core-personal-files
 
   VM_TIMEOUT is generous because cloud-init runs apt on first boot; multipass's
   own 5-minute default is not enough and fails looking like a hang.
@@ -141,6 +174,7 @@ Examples
   vm new                          # 4-core / 8G / 40G Ubuntu 26.04 named "scratch"
   vm new ansible-test             # a second, differently-named box
   vm run scratch uname -a
+  vm new newmachine -b          # clean box, seeded for setup-new-machine.sh
   vm mount scratch ~/Documents/degel/blogscraper   # but see [!] under mount
   vm snap scratch clean-base      # checkpoint before you break something
   vm restore scratch clean-base   # go back to it
@@ -149,7 +183,8 @@ Examples
 EOF
 }
 
-die() { echo "vm: $*" >&2; exit 1; }
+die()  { echo "vm: $*" >&2; exit 1; }
+warn() { echo "vm: [!] $*" >&2; }
 
 need_multipass() {
   command -v multipass >/dev/null 2>&1 \
@@ -209,12 +244,92 @@ vm_exec() {
   ssh "${opts[@]}" "$target" "$remote"
 }
 
+# multipass transfer rides the same broken client path as `multipass exec`, so
+# try it and fall back to tar over the ssh connection we know works.
+copy_into() {
+  local name="$1" src="$2" dest="$3"
+  multipass transfer -r "$src" "$name:$dest" 2>/dev/null && return 0
+  local parent base
+  parent="$(cd "$(dirname "$src")" && pwd)"
+  base="$(basename "$src")"
+  # --no-xattrs: macOS tar otherwise emits com.apple.provenance headers that
+  # GNU tar in the VM complains about on every single file.
+  COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C "$parent" "$base" \
+    | vm_exec "$name" tar -xf - -C "$dest"
+}
+
+apply_mounts() {
+  local name="$1" spec src target
+  [[ -n "$VM_MOUNTS" ]] || return 0
+  for spec in $VM_MOUNTS; do
+    src="${spec%%:*}"; target="${spec#*:}"
+    src="${src/#\~/$HOME}"
+    if [[ ! -d "$src" ]]; then
+      warn "skipping mount, no such directory: $src"
+      continue
+    fi
+    if multipass mount "$src" "$name:$target" >/dev/null 2>&1; then
+      echo "Mounted $src -> $name:$target"
+      # macOS hides ~/Documents, ~/Desktop and ~/Downloads from multipassd, in
+      # which case the mount attaches but reads empty inside the VM. Say so now
+      # rather than let it be discovered halfway through a build.
+      if [[ -n "$(ls -A "$src" 2>/dev/null)" ]] \
+         && [[ -z "$(vm_exec "$name" ls -A "$target" 2>/dev/null)" ]]; then
+        warn "$target reads EMPTY in the VM although $src is not."
+        warn "Fix: grant Full Disk Access to"
+        warn "  /Library/Application Support/com.canonical.multipass/bin/multipassd"
+      fi
+    else
+      warn "failed to mount $src"
+    fi
+  done
+}
+
+cmd_bootstrap() {
+  local name="${1:-$VM_DEFAULT_NAME}"
+  exists "$name" || die "no such instance: $name"
+  [[ -f "$VM_BOOTSTRAP_KEY" ]] || die "no bootstrap key at $VM_BOOTSTRAP_KEY"
+  [[ -d "$VM_BOOTSTRAP_DIR/.git" ]] || die "not a git checkout: $VM_BOOTSTRAP_DIR"
+
+  local key; key="$(basename "$VM_BOOTSTRAP_KEY")"
+  echo "Seeding '$name' the way a new machine gets seeded by hand..."
+
+  vm_exec "$name" mkdir -p /home/ubuntu/.ssh
+  vm_exec "$name" chmod 700 /home/ubuntu/.ssh
+  # Shell snippets go through `bash -c` because vm_exec re-quotes each argument
+  # -- a bare "cat > file" would arrive as a command name, not a redirect.
+  vm_exec "$name" bash -c "cat > /home/ubuntu/.ssh/$key" < "$VM_BOOTSTRAP_KEY"
+  vm_exec "$name" chmod 600 "/home/ubuntu/.ssh/$key"
+  if [[ -f "$VM_BOOTSTRAP_KEY.pub" ]]; then
+    vm_exec "$name" bash -c "cat > /home/ubuntu/.ssh/$key.pub" < "$VM_BOOTSTRAP_KEY.pub"
+  fi
+
+  # Minimal ssh config pointing github at that one key. The host's own
+  # ~/.ssh/config names client infrastructure and is macOS-specific, so it
+  # deliberately does not travel.
+  vm_exec "$name" bash -c "printf 'Host github.com\n  HostName github.com\n  IdentityFile ~/.ssh/%s\n  StrictHostKeyChecking accept-new\n' '$key' > /home/ubuntu/.ssh/config"
+  vm_exec "$name" chmod 600 /home/ubuntu/.ssh/config
+
+  echo "Copying $(basename "$VM_BOOTSTRAP_DIR") ($(du -sh "$VM_BOOTSTRAP_DIR" | cut -f1))..."
+  copy_into "$name" "$VM_BOOTSTRAP_DIR" /home/ubuntu
+
+  echo
+  echo "Seeded. Now run the setup by hand, inside the VM:"
+  echo "    vm sh $name"
+  # An encrypted key would otherwise prompt for its passphrase once per clone.
+  if ! ssh-keygen -y -P "" -f "$VM_BOOTSTRAP_KEY" >/dev/null 2>&1; then
+    echo "    eval \$(ssh-agent) && ssh-add ~/.ssh/$key   # $key has a passphrase"
+  fi
+  echo "    ./core-personal-files/setup-new-machine.sh"
+}
+
 cmd_new() {
-  local name="" ci="$VM_CLOUD_INIT"
+  local name="" ci="$VM_CLOUD_INIT" boot=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -i|--cloud-init) ci="$2"; shift 2 ;;
       --no-cloud-init) ci=""; shift ;;
+      -b|--bootstrap)  boot=1; shift ;;
       -*) die "unknown option for new: $1" ;;
       *) name="$1"; shift ;;
     esac
@@ -236,6 +351,9 @@ cmd_new() {
   echo "First launch of a new release downloads an image; later ones are cached."
 
   multipass "${args[@]}"
+  echo
+  apply_mounts "$name"
+  [[ $boot -eq 1 ]] && cmd_bootstrap "$name"
   echo
   echo "Ready: $name at $(cmd_ip "$name")"
   echo "Reconnect any time with: vm sh $name"
@@ -272,6 +390,7 @@ cmd_reset() {
       -f|--force) force=1; shift ;;
       -i|--cloud-init) passthru+=( -i "$2" ); shift 2 ;;
       --no-cloud-init) passthru+=( --no-cloud-init ); shift ;;
+      -b|--bootstrap)  passthru+=( --bootstrap ); shift ;;
       -*) die "unknown option for reset: $1" ;;
       *) name="$1"; shift ;;
     esac
@@ -389,6 +508,7 @@ case "$cmd" in
   mount)          cmd_mount "$@" ;;
   snap|snapshot)  cmd_snap "$@" ;;
   restore)        cmd_restore "$@" ;;
+  bootstrap)      cmd_bootstrap "$@" ;;
   gui)            cmd_gui ;;
   -h|--help|help) show_help ;;
   *)              echo "vm: unknown command '$cmd'" >&2; echo >&2; show_help >&2; exit 1 ;;
