@@ -382,7 +382,12 @@ cmd_new() {
   multipass "${args[@]}"
   echo
   apply_mounts "$name"
-  [[ $boot -eq 1 ]] && cmd_bootstrap "$name"
+  # An `if`, not `[[ ... ]] && cmd_bootstrap`: the latter puts the call in an
+  # && list, where errexit is suppressed, so a failed seeding passed silently
+  # and left a VM that looked ready but had none of its files.
+  if [[ $boot -eq 1 ]]; then
+    cmd_bootstrap "$name" || die "bootstrap failed; VM '$name' is up but unseeded (retry: vm bootstrap $name)"
+  fi
   echo
   echo "Ready: $name at $(cmd_ip "$name")"
   echo "Reconnect any time with: vm sh $name"
