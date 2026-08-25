@@ -52,18 +52,44 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
+There is no Makefile and no test framework — this is a directory of standalone
+scripts, and most have no tests. Nothing is built; scripts run from `~/bin`,
+which is on PATH.
 
 ```bash
-# Example:
-# npm install
-# npm test
+shellcheck -s bash vm vm-test   # lint (brew install shellcheck)
+./vm-test                       # the one suite that exists: 55 checks, ~1s, no VM
 ```
+
+If you add tests for another script, follow `vm-test`: a plain executable
+alongside the script it covers, fast enough to run every time, no dependencies.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+Flat collection of ~40 independent scripts, each solving one problem, plus a
+few data files they read. There is no shared library and no build step; scripts
+do not import each other. Treat each as its own project.
+
+The larger ones worth knowing: `vm` (disposable Ubuntu VMs over multipass, with
+`vm-test` and `vm-cloud-init/`), `worklog` and `timesheet-sheet` (evidence
+harvesting for timesheet reconstruction), `init_python_project`, and
+`git-show-branches`.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- **New scripts**: `#!/usr/bin/env bash` + `set -euo pipefail`, a `show_help()`
+  heredoc, and `-h|--help`. `git-show-branches` and `vm` are the models. Older
+  scripts use `#!/bin/sh` or `#!/bin/bash`; leave them alone rather than
+  converting.
+- **Non-interactive flags everywhere** — see AGENTS.md. `rm`/`cp`/`mv` are
+  aliased to `-i` in this user's shell and will hang an agent until timeout.
+- **Comments explain why, not what.** The audience is a senior dev re-reading
+  this in a year, usually to answer "why is this done the hard way?"
+- **Destructive paths are guarded and never tested against live state.** `vm`
+  has `VM_PROTECTED`; `vm-test` only ever names a VM that cannot exist. A guard
+  that fails open has already destroyed a real VM here once.
+- **Bash traps that have bitten this repo**: errexit is suppressed through a
+  function's entire body when it is called from `if`, `&&` or `||`, so guard
+  steps inside the function rather than at the call site; and `[[ "$a" == "$b" ]]`
+  compares literally because the right side is quoted — leave it unquoted when
+  you want a glob.
