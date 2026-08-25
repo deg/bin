@@ -20,9 +20,10 @@ VM_TIMEOUT="${VM_TIMEOUT:-600}"
 VM_CLOUD_INIT="${VM_CLOUD_INIT:-$SELF_DIR/vm-cloud-init/dev.yaml}"
 VM_SSH_KEY="${VM_SSH_KEY:-$HOME/.ssh/multipass_vm}"
 
-# Instances this tool refuses to destroy without --force. Long-lived VMs that
-# predate the disposable workflow live here so a stray `vm nuke` can't reap them.
-VM_PROTECTED="${VM_PROTECTED:-primary blissful-tamandua}"
+# Space-separated instances `vm nuke` and `vm reset` refuse to touch without
+# --force. Empty by default -- everything is disposable until you say otherwise.
+# Name any long-lived VM here (best set in ~/.vmrc) to shield it.
+VM_PROTECTED="${VM_PROTECTED:-}"
 
 show_help() {
   cat <<'EOF'
@@ -117,7 +118,7 @@ Configuration (environment, or ~/.vmrc)
   VM_TIMEOUT=600     VM_DEFAULT_NAME=scratch
   VM_CLOUD_INIT=<path to cloud-init YAML>
   VM_SSH_KEY=~/.ssh/multipass_vm    (fallback key, see below)
-  VM_PROTECTED="primary blissful-tamandua"
+  VM_PROTECTED=""       (space-separated names vm nuke/reset won't touch)
 
   VM_TIMEOUT is generous because cloud-init runs apt on first boot; multipass's
   own 5-minute default is not enough and fails looking like a hang.
