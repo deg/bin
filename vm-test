@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Tests for `vm`. No framework: this repo has none, and one script does not
+# justify introducing one.
+#
+# Everything here runs in under a second and needs no VM. That is deliberate --
+# the parts of `vm` worth guarding against regression are the ones that are
+# pure logic and easy to get subtly wrong (argument parsing, the protection
+# guard, remote-argument quoting). The parts that drive multipass are covered
+# by using the tool, not by a suite that would take minutes per run and depend
+# on a working daemon.
+set -uo pipefail
+
+VM="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vm"
+pass=0 fail=0
+
+ok() { printf '  [x] %s\n' "$1"; pass=$((pass + 1)); }
+no() { printf '  [!] %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; fail=$((fail + 1)); }
+
+check() {  # check <label> <expected> <actual>
+  if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "$2" "$3"; fi
+}
+
+contains() {  # contains <label> <needle> <haystack>
+  if [[ "$3" == *"$2"* ]]; then ok "$1"; else no "$1" "contains '$2'" "$3"; fi
+}
+
+echo "vm-test"
+echo
+
+echo "syntax and lint"
+if bash -n "$VM"; then ok "parses"; else no "parses" "clean parse" "syntax error"; fi
+if command -v shellcheck >/dev/null 2>&1; then
+  out="$(shellcheck -s bash "$VM" 2>&1)"
+  check "shellcheck clean" "" "$out"
+else
+  echo "  [-] shellcheck not installed, skipping"
+fi
+
+echo
+echo "usage and dispatch"
+# A bare `vm` must exit nonzero, so it cannot be mistaken for success in a
+# script that forgot its subcommand.
+"$VM" >/dev/null 2>&1; check "no args exits 1" "1" "$?"
+"$VM" help >/dev/null 2>&1; check "help exits 0" "0" "$?"
+"$VM" --help >/dev/null 2>&1; check "--help exits 0" "0" "$?"
+"$VM" bogus >/dev/null 2>&1; check "unknown command exits 1" "1" "$?"
+contains "unknown command names it" "unknown command 'bogus'" "$("$VM" bogus 2>&1)"
+
+echo
+echo "help documents every dispatched subcommand"
+# Guards the commonest rot in this script: adding a case to the dispatcher and
+# forgetting the help entry that tells anyone it exists.
+help_text="$("$VM" help 2>&1)"
+for sub in new reset nuke gc recover stop start restart suspend \
+           shell run ls ip mount umount push pull clone snap restore \
+           bootstrap gui help; do
+  # Entries appear either as their own indented line ("  ls") or share one with
+  # siblings ("sh|shell [name]", "stop [name] | start [name]").
+  if grep -qE "(^  |\| ?)$sub([ |[]|$)" <<<"$help_text"; then
+    ok "help documents '$sub'"
+  else
+    no "help documents '$sub'" "an entry for $sub" "none found"
+  fi
+done
+
+echo
+echo "protection guard"
+# VM_PROTECTED is the only thing standing between a typo and a VM you cared
+# about, so verify it refuses BEFORE the instance-existence check runs.
+#
+# The name below must never name a real instance. `reset` on an unprotected
+# name creates one, and an early version of this suite did exactly that: the
+# guard ran after the existence check, so reset sailed past it and launched a
+# VM. Hence the cleanup assertion at the end of this block.
+guarded="vm-test-must-not-exist"
+out="$(VM_PROTECTED="$guarded" "$VM" nuke "$guarded" 2>&1)"; rc=$?
+check "protected nuke exits 1" "1" "$rc"
+contains "protected nuke explains itself" "is protected" "$out"
+out="$(VM_PROTECTED="$guarded" "$VM" reset "$guarded" 2>&1)"; rc=$?
+check "protected reset exits 1" "1" "$rc"
+contains "protected reset explains itself" "is protected" "$out"
+# Entries are glob patterns. A literal comparison here would mean a user who
+# writes "prod-*" gets no protection at all and is never told -- the exact
+# fail-open that cost a live VM once already. Both forms are checked from a
+# directory containing files that would match, so a regression to globbing
+# against the filesystem also shows up.
+( cd "$(mktemp -d)" && touch "vm-test-a" "vm-test-b" \
+  && VM_PROTECTED="vm-test-*" "$VM" nuke "vm-test-must-not-exist" 2>&1 ) >/dev/null 2>&1
+rc=$?
+check "pattern entry protects (exits 1)" "1" "$rc"
+out="$(VM_PROTECTED="vm-test-*" "$VM" nuke "vm-test-must-not-exist" 2>&1)"
+contains "pattern entry explains itself" "is protected" "$out"
+# If the guard ever regresses, reset will have built a VM. Catch that here
+# rather than leaving a stray instance behind for someone to find later.
+if command -v multipass >/dev/null 2>&1; then
+  check "guard created no instance" "" "$(multipass list --format csv 2>/dev/null | grep "^$guarded," || true)"
+fi
+
+echo
+echo "argument validation"
+contains "mount without args" "usage: vm mount" "$("$VM" mount 2>&1)"
+contains "push without args" "usage: vm push" "$("$VM" push 2>&1)"
+contains "pull without args" "usage: vm pull" "$("$VM" pull 2>&1)"
+contains "snap without args" "usage: vm snap" "$("$VM" snap 2>&1)"
+contains "restore without snapshot" "usage: vm restore" "$("$VM" restore onlyname 2>&1)"
+contains "clone without args" "usage: vm clone" "$("$VM" clone 2>&1)"
+contains "run without command" "usage: vm run" "$("$VM" run onlyname 2>&1)"
+contains "new rejects bad option" "unknown option for new" "$("$VM" new -Z 2>&1)"
+
+echo
+echo "remote argument quoting"
+# vm_exec re-quotes each argument because ssh flattens argv into one string for
+# the remote shell. This reproduces that quoting in isolation: without it,
+# `vm run box bash -c 'touch ~/f'` arrives as several words and is re-parsed.
+requote() { local out="" a; for a in "$@"; do out+="$(printf '%q ' "$a")"; done; printf '%s' "$out"; }
+check "spaces survive" "a\ b " "$(requote 'a b')"
+contains "globs are escaped" '\*' "$(requote '*.log')"
+contains "quotes are escaped" "'" "$(requote "it's")"
+# The round trip is what actually matters: re-parsing must yield the original.
+eval "set -- $(requote 'one two' '*.log' "it's")"
+check "round-trips arg count" "3" "$#"
+check "round-trips arg 1" "one two" "$1"
+check "round-trips arg 2" "*.log" "$2"
+check "round-trips arg 3" "it's" "$3"
+
+echo
+echo "cloud-init"
+ci="$(dirname "$VM")/vm-cloud-init/dev.yaml"
+if [[ -f "$ci" ]]; then
+  ok "default cloud-init exists"
+  check "starts with #cloud-config" "#cloud-config" "$(head -1 "$ci")"
+  # Without this key the ssh fallback cannot reach a freshly created VM at all.
+  if grep -q 'ssh_authorized_keys' "$ci"; then
+    ok "installs the fallback key"
+  else
+    no "installs the fallback key" "ssh_authorized_keys present" "absent"
+  fi
+else
+  no "default cloud-init exists" "$ci" "missing"
+fi
+
+echo
+printf '%d passed, %d failed\n' "$pass" "$fail"
+[[ $fail -eq 0 ]]
