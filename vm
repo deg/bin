@@ -7,9 +7,19 @@ set -euo pipefail
 # far too small to be useful, and its two most valuable features — cloud-init
 # provisioning and --purge teardown — are the ones easiest to forget to type.
 
-[[ -f "$HOME/.vmrc" ]] && source "$HOME/.vmrc"
-
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Precedence: environment > ~/.vmrc > the defaults below. The environment has
+# to be snapshotted first, because .vmrc assigns plainly -- without this,
+# `VM_CPUS=8 vm new` would be silently overridden by the config file, and a
+# VM_PROTECTED passed for one command would not apply at all.
+_vm_env="$(export -p | grep '^declare -x VM_' || true)"
+if [[ -f "$HOME/.vmrc" ]]; then
+  # shellcheck source=/dev/null  # optional user config, absent by default
+  source "$HOME/.vmrc"
+fi
+if [[ -n "$_vm_env" ]]; then eval "$_vm_env"; fi
+unset _vm_env
 
 VM_IMAGE="${VM_IMAGE:-26.04}"
 VM_CPUS="${VM_CPUS:-4}"
@@ -134,9 +144,10 @@ Persistence
       restarts it if it had been running.
 
   restore <name> <snap>
-      Roll the VM back to a checkpoint, then restart it. DESTRUCTIVE: every
-      change made since that snapshot is discarded, and it does not stop to
-      ask. Snapshots capture installed system state; use mounts for files.
+      Roll the VM back to a checkpoint. DESTRUCTIVE: every change made since
+      that snapshot is discarded, and it does not stop to ask. A VM that was
+      running is restarted afterwards; one that was already stopped stays
+      stopped. Snapshots capture installed system state; use mounts for files.
 
 Bootstrapping a new-machine test
 --------------------------------
@@ -175,7 +186,8 @@ Configuration (environment, or ~/.vmrc)
   VM_TIMEOUT=600     VM_DEFAULT_NAME=scratch
   VM_CLOUD_INIT=<path to cloud-init YAML>
   VM_SSH_KEY=~/.ssh/multipass_vm    (fallback key, see below)
-  VM_PROTECTED=""       (space-separated names vm nuke/reset won't touch)
+  VM_PROTECTED=""       Space-separated names vm nuke/reset refuse to touch.
+                        Entries are glob patterns, so "prod-*" covers a family.
   VM_MOUNTS="$HOME/Documents:host-documents"
                         Space-separated <src>:<target> pairs mounted by
                         `vm new`. Relative targets land under /home/ubuntu.
@@ -215,6 +227,14 @@ EOF
 die()  { echo "vm: $*" >&2; exit 1; }
 warn() { echo "vm: [!] $*" >&2; }
 
+# Run a step that must succeed, aborting with a clear message if it does not.
+#
+# Needed because errexit is suppressed throughout a function invoked from an
+# `if` condition, an `&&`, or an `||` -- which is how these commands get called.
+# A step that merely returns nonzero would otherwise sail past unnoticed, so
+# the check has to be on the step itself rather than on the caller.
+must() { "$@" || die "step failed: $*"; }
+
 need_multipass() {
   command -v multipass >/dev/null 2>&1 \
     || die "multipass not found. Install from https://multipass.run/"
@@ -224,53 +244,114 @@ exists() { multipass info "$1" >/dev/null 2>&1; }
 
 is_protected() {
   local n="$1" p
-  for p in $VM_PROTECTED; do [[ "$n" == "$p" ]] && return 0; done
+  local -a protected=()
+  # `read -a` splits on whitespace WITHOUT globbing. A bare `for p in
+  # $VM_PROTECTED` also glob-expands, so VM_PROTECTED="scratch*" would expand
+  # against the working directory and quietly protect nothing at all -- a
+  # destructive guard failing open.
+  if [[ -n "$VM_PROTECTED" ]]; then read -r -a protected <<<"$VM_PROTECTED"; fi
+  local i
+  for (( i = 0; i < ${#protected[@]}; i++ )); do
+    p="${protected[i]}"
+    # Unquoted on the right so entries work as patterns: "prod-*" shields every
+    # prod box. Quoting it would compare literally, and VM_PROTECTED="scratch*"
+    # would then silently protect nothing -- a destructive guard failing open,
+    # which is the one way this must never fail.
+    # shellcheck disable=SC2053  # glob matching is the point
+    [[ "$n" == $p ]] && return 0
+  done
   return 1
+}
+
+# Refuse destructive work on a name listed in VM_PROTECTED. Callers check this
+# BEFORE asking whether the instance exists: protection is a property of the
+# name, so it should hold whether or not the instance happens to be there right
+# now -- which also means the guard can be verified without a real VM at risk.
+guard_protected() {
+  local name="$1" force="$2"
+  if is_protected "$name" && [[ $force -eq 0 ]]; then
+    die "'$name' is protected (VM_PROTECTED). Re-run with --force if you really mean it."
+  fi
 }
 
 state_of() {
   multipass info "$1" --format csv 2>/dev/null | awk -F, 'NR==2 {print $2}'
 }
 
-# multipass's client SSH is broken on this host (see `vm help`). Try it anyway
-# -- it is the supported path and may be fixed -- then fall back to plain ssh
-# against the key cloud-init installed.
-ssh_target() {
-  local name="$1" ip
-  ip="$(cmd_ip "$name")" || return 1
-  [[ -n "$ip" ]] || return 1
-  printf 'ubuntu@%s' "$ip"
+# --- Reaching into an instance ---------------------------------------------
+#
+# multipass's own client cannot open SSH sessions on some hosts (see the "No
+# route to host" note in `vm help`), so every way in falls back to plain ssh
+# with VM_SSH_KEY.
+#
+# Which path to use is probed ONCE per run, deliberately, rather than inferred
+# from each call's exit status. "multipass exec failed" and "the remote command
+# exited nonzero" are indistinguishable by exit status alone, so retrying on
+# nonzero would run a working command a second time -- and re-read a stdin that
+# the first attempt had already consumed.
+
+SSH_OPTS=( -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+           -o LogLevel=ERROR -o ConnectTimeout=10 )
+
+_client_usable=""
+
+client_usable() {
+  if [[ -z "$_client_usable" ]]; then
+    # </dev/null: the probe must not read the caller's stdin. copy_into pipes a
+    # tar stream through vm_exec, and a probe that buffered any of it would
+    # truncate the archive with no visible error.
+    if multipass exec "$1" -- true >/dev/null 2>&1 </dev/null; then
+      _client_usable=yes
+    else
+      _client_usable=no
+      echo "(multipass client cannot open sessions here; using ssh)" >&2
+    fi
+  fi
+  [[ "$_client_usable" == yes ]]
 }
 
-ssh_opts() {
-  printf '%s\n' -i "$VM_SSH_KEY" \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR -o ConnectTimeout=10
+# Echoes ubuntu@<ip> for the ssh fallback, or dies. Callers assign it on its
+# own line so that a die() inside this subshell still trips errexit.
+fallback_target() {
+  [[ -f "$VM_SSH_KEY" ]] || die "no fallback ssh key at $VM_SSH_KEY"
+  # cmd_ip already reports a missing instance; exit rather than say it twice.
+  local ip; ip="$(cmd_ip "$1")" || exit 1
+  [[ -n "$ip" ]] || die "'$1' has no IP yet"
+  printf 'ubuntu@%s' "$ip"
 }
 
 vm_connect() {
   local name="$1"
-  multipass shell "$name" 2>/dev/null && return 0
-  [[ -f "$VM_SSH_KEY" ]] || die "multipass shell failed and no fallback key at $VM_SSH_KEY"
-  local target; target="$(ssh_target "$name")" \
-    || die "multipass shell failed and '$name' has no IP yet"
-  echo "(multipass shell failed; falling back to ssh $target)" >&2
-  local opts; IFS=$'\n' read -r -d '' -a opts < <(ssh_opts && printf '\0')
-  ssh "${opts[@]}" "$target"
+  if client_usable "$name"; then
+    multipass shell "$name"
+    return
+  fi
+  # fallback_target's die() only exits the command substitution, so an empty
+  # result must be caught here -- otherwise ssh gets an empty hostname and
+  # quietly tries the local machine instead.
+  local target; target="$(fallback_target "$name")"
+  [[ -n "$target" ]] || die "cannot determine an ssh target for '$name'"
+  # shellcheck disable=SC2029  # no remote command here; $target is the host
+  ssh -i "$VM_SSH_KEY" "${SSH_OPTS[@]}" "$target"
 }
 
 vm_exec() {
   local name="$1"; shift
-  multipass exec "$name" -- "$@" 2>/dev/null && return 0
-  [[ -f "$VM_SSH_KEY" ]] || die "multipass exec failed and no fallback key at $VM_SSH_KEY"
-  local target; target="$(ssh_target "$name")" \
-    || die "multipass exec failed and '$name' has no IP"
-  local opts; IFS=$'\n' read -r -d '' -a opts < <(ssh_opts && printf '\0')
+  if client_usable "$name"; then
+    multipass exec "$name" -- "$@"
+    return
+  fi
+  # fallback_target's die() only exits the command substitution, so an empty
+  # result must be caught here -- otherwise ssh gets an empty hostname and
+  # quietly tries the local machine instead.
+  local target; target="$(fallback_target "$name")"
+  [[ -n "$target" ]] || die "cannot determine an ssh target for '$name'"
   # ssh flattens argv into one string for the remote shell, so re-quote each
-  # argument or anything with spaces/globs/quotes gets re-parsed remotely.
+  # argument or anything with spaces, globs or quotes gets re-parsed remotely.
   local remote="" a
   for a in "$@"; do remote+="$(printf '%q ' "$a")"; done
-  ssh "${opts[@]}" "$target" "$remote"
+  # shellcheck disable=SC2029  # $remote is pre-quoted on purpose, client-side
+  ssh -i "$VM_SSH_KEY" "${SSH_OPTS[@]}" "$target" "$remote"
 }
 
 # multipass transfer rides the same broken client path as `multipass exec`, so
@@ -289,27 +370,37 @@ copy_into() {
 
 apply_mounts() {
   local name="$1" spec src target
+  local -a specs=()
   [[ -n "$VM_MOUNTS" ]] || return 0
-  for spec in $VM_MOUNTS; do
+  # Split without globbing, for the same reason as is_protected().
+  read -r -a specs <<<"$VM_MOUNTS"
+  for spec in ${specs[@]+"${specs[@]}"}; do
     src="${spec%%:*}"; target="${spec#*:}"
     src="${src/#\~/$HOME}"
     if [[ ! -d "$src" ]]; then
       warn "skipping mount, no such directory: $src"
       continue
     fi
-    if multipass mount "$src" "$name:$target" >/dev/null 2>&1; then
-      echo "Mounted $src -> $name:$target"
-      # macOS hides ~/Documents, ~/Desktop and ~/Downloads from multipassd, in
-      # which case the mount attaches but reads empty inside the VM. Say so now
-      # rather than let it be discovered halfway through a build.
-      if [[ -n "$(ls -A "$src" 2>/dev/null)" ]] \
-         && [[ -z "$(vm_exec "$name" ls -A "$target" 2>/dev/null)" ]]; then
-        warn "$target reads EMPTY in the VM although $src is not."
-        warn "Fix: grant Full Disk Access to"
-        warn "  /Library/Application Support/com.canonical.multipass/bin/multipassd"
-      fi
-    else
+    if ! multipass mount "$src" "$name:$target" >/dev/null 2>&1; then
       warn "failed to mount $src"
+      continue
+    fi
+    echo "Mounted $src -> $name:$target"
+
+    # macOS hides ~/Documents, ~/Desktop and ~/Downloads from multipassd, in
+    # which case the mount attaches but reads empty inside the VM. Warn now
+    # rather than let it be discovered halfway through a build.
+    #
+    # Probe reachability first: without it, an unreachable VM yields an empty
+    # string here too, and every mount would be blamed on Full Disk Access when
+    # the real fault is that we cannot get into the VM at all.
+    if ! vm_exec "$name" true >/dev/null 2>&1 </dev/null; then
+      warn "cannot reach '$name' to check whether $target is readable"
+    elif [[ -n "$(ls -A "$src" 2>/dev/null)" ]] \
+         && [[ -z "$(vm_exec "$name" ls -A "$target" 2>/dev/null </dev/null)" ]]; then
+      warn "$target reads EMPTY in the VM although $src is not."
+      warn "Fix: grant Full Disk Access to"
+      warn "  /Library/Application Support/com.canonical.multipass/bin/multipassd"
     fi
   done
 }
@@ -323,24 +414,27 @@ cmd_bootstrap() {
   local key; key="$(basename "$VM_BOOTSTRAP_KEY")"
   echo "Seeding '$name' the way a new machine gets seeded by hand..."
 
-  vm_exec "$name" mkdir -p /home/ubuntu/.ssh
-  vm_exec "$name" chmod 700 /home/ubuntu/.ssh
+  # Every step is wrapped in must(): see its comment. A half-seeded VM that
+  # reports success is the worst outcome here, because the failure only shows
+  # up much later as an inexplicable error from setup-new-machine.sh.
+  must vm_exec "$name" mkdir -p /home/ubuntu/.ssh
+  must vm_exec "$name" chmod 700 /home/ubuntu/.ssh
   # Shell snippets go through `bash -c` because vm_exec re-quotes each argument
   # -- a bare "cat > file" would arrive as a command name, not a redirect.
-  vm_exec "$name" bash -c "cat > /home/ubuntu/.ssh/$key" < "$VM_BOOTSTRAP_KEY"
-  vm_exec "$name" chmod 600 "/home/ubuntu/.ssh/$key"
+  must vm_exec "$name" bash -c "cat > /home/ubuntu/.ssh/$key" < "$VM_BOOTSTRAP_KEY"
+  must vm_exec "$name" chmod 600 "/home/ubuntu/.ssh/$key"
   if [[ -f "$VM_BOOTSTRAP_KEY.pub" ]]; then
-    vm_exec "$name" bash -c "cat > /home/ubuntu/.ssh/$key.pub" < "$VM_BOOTSTRAP_KEY.pub"
+    must vm_exec "$name" bash -c "cat > /home/ubuntu/.ssh/$key.pub" < "$VM_BOOTSTRAP_KEY.pub"
   fi
 
   # Minimal ssh config pointing github at that one key. The host's own
   # ~/.ssh/config names client infrastructure and is macOS-specific, so it
   # deliberately does not travel.
-  vm_exec "$name" bash -c "printf 'Host github.com\n  HostName github.com\n  IdentityFile ~/.ssh/%s\n  StrictHostKeyChecking accept-new\n' '$key' > /home/ubuntu/.ssh/config"
-  vm_exec "$name" chmod 600 /home/ubuntu/.ssh/config
+  must vm_exec "$name" bash -c "printf 'Host github.com\n  HostName github.com\n  IdentityFile ~/.ssh/%s\n  StrictHostKeyChecking accept-new\n' '$key' > /home/ubuntu/.ssh/config"
+  must vm_exec "$name" chmod 600 /home/ubuntu/.ssh/config
 
   echo "Copying $(basename "$VM_BOOTSTRAP_DIR") ($(du -sh "$VM_BOOTSTRAP_DIR" | cut -f1))..."
-  copy_into "$name" "$VM_BOOTSTRAP_DIR" /home/ubuntu
+  must copy_into "$name" "$VM_BOOTSTRAP_DIR" /home/ubuntu
 
   echo
   echo "Seeded. Now run the setup by hand, inside the VM:"
@@ -356,11 +450,14 @@ cmd_new() {
   local name="" ci="$VM_CLOUD_INIT" boot=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -i|--cloud-init) ci="$2"; shift 2 ;;
+      -i|--cloud-init) [[ $# -ge 2 ]] || die "usage: vm new [name] [-i FILE] [-b]"
+                       ci="$2"; shift 2 ;;
       --no-cloud-init) ci=""; shift ;;
       -b|--bootstrap)  boot=1; shift ;;
       -*) die "unknown option for new: $1" ;;
-      *) name="$1"; shift ;;
+      # Refuse a second name rather than silently keeping the last one.
+      *) [[ -z "$name" ]] || die "too many arguments: '$name' and '$1'"
+         name="$1"; shift ;;
     esac
   done
   name="${name:-$VM_DEFAULT_NAME}"
@@ -382,12 +479,10 @@ cmd_new() {
   multipass "${args[@]}"
   echo
   apply_mounts "$name"
-  # An `if`, not `[[ ... ]] && cmd_bootstrap`: the latter puts the call in an
-  # && list, where errexit is suppressed, so a failed seeding passed silently
-  # and left a VM that looked ready but had none of its files.
-  if [[ $boot -eq 1 ]]; then
-    cmd_bootstrap "$name" || die "bootstrap failed; VM '$name' is up but unseeded (retry: vm bootstrap $name)"
-  fi
+  # cmd_bootstrap guards its own steps with must(); wrapping the call in
+  # `|| die` here would be worse than useless, since putting the call in an
+  # || list suppresses errexit for the whole of its body.
+  if [[ $boot -eq 1 ]]; then cmd_bootstrap "$name"; fi
   echo
   echo "Ready: $name at $(cmd_ip "$name")"
   echo "Reconnect any time with: vm sh $name"
@@ -401,16 +496,16 @@ cmd_nuke() {
     case "$1" in
       -f|--force) force=1; shift ;;
       -*) die "unknown option for nuke: $1" ;;
-      *) name="$1"; shift ;;
+      # `multipass delete` takes several names, so `vm nuke old keeper` is a
+      # natural thing to type. Keeping only the last would purge the wrong VM.
+      *) [[ -z "$name" ]] || die "too many arguments: '$name' and '$1' (nuke takes one instance)"
+         name="$1"; shift ;;
     esac
   done
   name="${name:-$VM_DEFAULT_NAME}"
 
+  guard_protected "$name" "$force"
   exists "$name" || { echo "vm: no instance '$name' — nothing to do."; return 0; }
-
-  if is_protected "$name" && [[ $force -eq 0 ]]; then
-    die "'$name' is protected (VM_PROTECTED). Re-run with --force if you really mean it."
-  fi
 
   echo "Destroying '$name' permanently..."
   multipass delete --purge "$name"
@@ -418,23 +513,35 @@ cmd_nuke() {
 }
 
 cmd_reset() {
-  local force=0 name="" passthru=()
+  local force=0 name="" boot=0 ci="$VM_CLOUD_INIT" passthru=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--force) force=1; shift ;;
-      -i|--cloud-init) passthru+=( -i "$2" ); shift 2 ;;
-      --no-cloud-init) passthru+=( --no-cloud-init ); shift ;;
-      -b|--bootstrap)  passthru+=( --bootstrap ); shift ;;
+      -i|--cloud-init) [[ $# -ge 2 ]] || die "usage: vm reset [name] [-i FILE] [-b]"
+                       ci="$2"; passthru+=( -i "$2" ); shift 2 ;;
+      --no-cloud-init) ci=""; passthru+=( --no-cloud-init ); shift ;;
+      -b|--bootstrap)  boot=1; passthru+=( --bootstrap ); shift ;;
       -*) die "unknown option for reset: $1" ;;
-      *) name="$1"; shift ;;
+      *) [[ -z "$name" ]] || die "too many arguments: '$name' and '$1' (reset takes one instance)"
+         name="$1"; shift ;;
     esac
   done
   name="${name:-$VM_DEFAULT_NAME}"
 
+  guard_protected "$name" "$force"
+
+  # Validate everything the rebuild will need BEFORE destroying anything.
+  # --purge is exactly what `vm recover` cannot undo, so a stale VM_CLOUD_INIT
+  # must not cost a live VM that then cannot be recreated.
+  [[ -z "$ci" || -f "$ci" ]] || die "cloud-init file not found: $ci (refusing to destroy '$name')"
+  if [[ $boot -eq 1 ]]; then
+    [[ -f "$VM_BOOTSTRAP_KEY" ]] \
+      || die "no bootstrap key at $VM_BOOTSTRAP_KEY (refusing to destroy '$name')"
+    [[ -d "$VM_BOOTSTRAP_DIR/.git" ]] \
+      || die "not a git checkout: $VM_BOOTSTRAP_DIR (refusing to destroy '$name')"
+  fi
+
   if exists "$name"; then
-    if is_protected "$name" && [[ $force -eq 0 ]]; then
-      die "'$name' is protected (VM_PROTECTED). Re-run with --force if you really mean it."
-    fi
     echo "Destroying existing '$name'..."
     multipass delete --purge "$name"
   fi
@@ -462,16 +569,20 @@ cmd_snap() {
     multipass stop "$name"
   fi
 
+  # On failure the VM must not be left stopped: it was running a moment ago,
+  # and a duplicate snapshot name is an easy mistake to make.
+  local rc=0
   if [[ -n "$label" ]]; then
-    multipass snapshot "$name" -n "$label"
+    multipass snapshot "$name" -n "$label" || rc=$?
   else
-    multipass snapshot "$name"
+    multipass snapshot "$name" || rc=$?
   fi
 
   if [[ "$was" == "Running" ]]; then
     echo "Restarting '$name'..."
     multipass start "$name"
   fi
+  [[ $rc -eq 0 ]] || die "snapshot of '$name' failed"
 }
 
 cmd_restore() {
@@ -483,12 +594,15 @@ cmd_restore() {
   local was; was="$(state_of "$name")"
   [[ "$was" == "Running" ]] && { echo "Stopping '$name'..."; multipass stop "$name"; }
 
-  multipass restore --destructive "$name.$snap"
+  # As in cmd_snap: a mistyped snapshot name must not leave the VM stopped.
+  local rc=0
+  multipass restore --destructive "$name.$snap" || rc=$?
 
   if [[ "$was" == "Running" ]]; then
     echo "Restarting '$name'..."
     multipass start "$name"
   fi
+  [[ $rc -eq 0 ]] || die "restore of '$name.$snap' failed (see 'vm ls' for snapshot names)"
 }
 
 cmd_mount() {
@@ -526,6 +640,14 @@ passthru() {
 # completes, stranding the instance in "Restarting" forever even though the VM
 # is up. Stop-then-start touches none of that and takes about 20 seconds.
 cmd_restart() {
+  # --all needs its own path: state_of reads a single CSV row, so asking it
+  # about "--all" would silently report only the first instance's state and
+  # skip the stop for everything else.
+  if [[ "${1:-}" == "--all" ]]; then
+    multipass stop --force --all
+    multipass start --all
+    return
+  fi
   local name="${1:-$VM_DEFAULT_NAME}"
   exists "$name" || die "no such instance: $name"
   [[ "$(state_of "$name")" == "Stopped" ]] || multipass stop --force "$name"
@@ -576,16 +698,19 @@ cmd_clone() {
     multipass stop "$src"
   fi
 
+  # As in cmd_snap: a name collision must not leave the source stopped.
+  local rc=0
   if [[ -n "$new" ]]; then
-    multipass clone "$src" -n "$new"
+    multipass clone "$src" -n "$new" || rc=$?
   else
-    multipass clone "$src"
+    multipass clone "$src" || rc=$?
   fi
 
   if [[ "$was" == "Running" ]]; then
     echo "Restarting '$src'..."
     multipass start "$src"
   fi
+  [[ $rc -eq 0 ]] || die "clone of '$src' failed"
 }
 
 cmd_ip() {
