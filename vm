@@ -68,6 +68,20 @@ Lifecycle
       Free disk from instances sitting in the Deleted state after a bare
       `multipass delete`. Never touches running or stopped instances.
 
+  recover [name]
+      Undo a plain `multipass delete` -- brings a Deleted instance back intact.
+      Powerless against `vm nuke` and `vm gc`, which purge.
+
+Power
+-----
+  stop [name] | start [name] | restart [name]
+      Shut the VM down / boot it / both. Stopping preserves the disk; it is
+      leaving the shell that costs nothing, not this. All three take --all.
+
+  suspend [name]
+      Freeze the VM's memory to disk and release its CPU and RAM. Resumes with
+      `start` faster than a stopped VM boots, and keeps running processes.
+
 Daily use
 ---------
   sh|shell [name]
@@ -96,6 +110,21 @@ Daily use
       reads as EMPTY inside the VM, with no error. Granting Full Disk Access to
       /Library/Application Support/com.canonical.multipass/bin/multipassd is
       the likely fix.
+
+  umount|unmount <name> [target]
+      Detach a mount. With no target, detaches every mount on that instance.
+      The host directory itself is untouched.
+
+  push <name> <host-path> [vm-dest]
+  pull <name> <vm-path> [host-dest]
+      Copy files in and out. `multipass transfer` rides the same broken client
+      path as `exec` here, so these fall back to tar over ssh. Defaults are
+      /home/ubuntu going in, the current directory coming out.
+
+  clone <source> [new-name]
+      Duplicate an instance, disk and all -- provision one box the slow way,
+      then stamp out copies. multipass can only clone a stopped instance, so
+      this stops the source, clones, and restarts it if it had been running.
 
 Persistence
 -----------
@@ -476,6 +505,84 @@ cmd_gc() {
   cmd_ls
 }
 
+# Pass through to multipass, defaulting to the usual instance when given no
+# arguments, but leaving flags like --all alone.
+passthru() {
+  local sub="$1"; shift
+  if [[ $# -eq 0 ]]; then
+    multipass "$sub" "$VM_DEFAULT_NAME"
+  else
+    multipass "$sub" "$@"
+  fi
+}
+
+# Deliberately NOT `multipass restart`, which is unusable on this machine: it
+# reboots the guest from inside, then waits for an SSH check that never
+# completes, stranding the instance in "Restarting" forever even though the VM
+# is up. Stop-then-start touches none of that and takes about 20 seconds.
+cmd_restart() {
+  local name="${1:-$VM_DEFAULT_NAME}"
+  exists "$name" || die "no such instance: $name"
+  [[ "$(state_of "$name")" == "Stopped" ]] || multipass stop --force "$name"
+  multipass start "$name"
+}
+
+cmd_umount() {
+  local name="${1:-}" target="${2:-}"
+  [[ -n "$name" ]] || die "usage: vm umount <name> [target]   (omit target to unmount all)"
+  exists "$name" || die "no such instance: $name"
+  if [[ -n "$target" ]]; then
+    multipass umount "$name:$target"
+  else
+    multipass umount "$name"
+  fi
+}
+
+cmd_push() {
+  local name="${1:-}" src="${2:-}" dest="${3:-/home/ubuntu}"
+  [[ -n "$name" && -n "$src" ]] || die "usage: vm push <name> <host-path> [vm-dest]"
+  [[ -e "$src" ]] || die "no such path: $src"
+  exists "$name" || die "no such instance: $name"
+  copy_into "$name" "$src" "$dest"
+  echo "Pushed $src -> $name:$dest"
+}
+
+cmd_pull() {
+  local name="${1:-}" src="${2:-}" dest="${3:-.}"
+  [[ -n "$name" && -n "$src" ]] || die "usage: vm pull <name> <vm-path> [host-dest]"
+  exists "$name" || die "no such instance: $name"
+  [[ -d "$dest" ]] || die "not a directory: $dest"
+  multipass transfer -r "$name:$src" "$dest" 2>/dev/null && {
+    echo "Pulled $name:$src -> $dest"; return 0; }
+  # Same broken-client fallback as copy_into, in the other direction.
+  vm_exec "$name" tar -cf - -C "$(dirname "$src")" "$(basename "$src")" \
+    | tar -xf - -C "$dest"
+  echo "Pulled $name:$src -> $dest"
+}
+
+cmd_clone() {
+  local src="${1:-}" new="${2:-}"
+  [[ -n "$src" ]] || die "usage: vm clone <source> [new-name]"
+  exists "$src" || die "no such instance: $src"
+
+  local was; was="$(state_of "$src")"
+  if [[ "$was" == "Running" ]]; then
+    echo "Stopping '$src' (multipass can only clone a stopped instance)..."
+    multipass stop "$src"
+  fi
+
+  if [[ -n "$new" ]]; then
+    multipass clone "$src" -n "$new"
+  else
+    multipass clone "$src"
+  fi
+
+  if [[ "$was" == "Running" ]]; then
+    echo "Restarting '$src'..."
+    multipass start "$src"
+  fi
+}
+
 cmd_ip() {
   local name="${1:-$VM_DEFAULT_NAME}"
   exists "$name" || die "no such instance: $name"
@@ -508,6 +615,15 @@ case "$cmd" in
   mount)          cmd_mount "$@" ;;
   snap|snapshot)  cmd_snap "$@" ;;
   restore)        cmd_restore "$@" ;;
+  stop)           passthru stop "$@" ;;
+  start)          passthru start "$@" ;;
+  restart)        cmd_restart "$@" ;;
+  suspend)        passthru suspend "$@" ;;
+  recover)        passthru recover "$@" ;;
+  umount|unmount) cmd_umount "$@" ;;
+  push)           cmd_push "$@" ;;
+  pull)           cmd_pull "$@" ;;
+  clone)          cmd_clone "$@" ;;
   bootstrap)      cmd_bootstrap "$@" ;;
   gui)            cmd_gui ;;
   -h|--help|help) show_help ;;
