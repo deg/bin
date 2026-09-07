@@ -1,0 +1,3 @@
+#!/bin/sh
+# Companion to asl: converts its .p output to a raw binary. See ./asl.
+exec /Users/deg/opt/asl/p2bin "$@"
