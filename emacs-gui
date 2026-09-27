@@ -1,0 +1,20 @@
+#!/bin/sh
+# Start GUI Emacs from a shell instead of from the Dock/Finder/Spotlight.
+#
+# On macOS 27, an emacsformacosx Emacs.app started through LaunchServices has
+# no windows visible to the Accessibility API, so Rectangle cannot move it
+# (https://github.com/caldwell/build-emacs/issues/157).  Started from a shell,
+# the same app works.  Run it through the bundle's launcher, not the
+# Emacs-arm64-11 binary it execs: the launcher sets LIBRARY_PATH for
+# libgccjit, without which native compilation fails.
+#
+# If Emacs is already running, just bring it to the front.
+
+EMACS_APP=/Applications/Emacs.app
+
+if pgrep -f "$EMACS_APP/Contents/MacOS/Emacs" >/dev/null; then
+    exec open -a "$EMACS_APP"
+fi
+
+cd "$HOME" || exit 1
+nohup "$EMACS_APP/Contents/MacOS/Emacs" "$@" >/dev/null 2>&1 &
