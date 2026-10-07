@@ -1,6 +1,0 @@
-#!/usr/bin/env python3
-"""Moved to https://github.com/deg/beads-utils"""
-import sys
-
-sys.stderr.write("bd-export-csv has moved to https://github.com/deg/beads-utils\n")
-sys.exit(1)

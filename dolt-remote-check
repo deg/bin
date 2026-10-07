@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# Moved to https://github.com/deg/beads-utils
-echo "dolt-remote-check has moved to https://github.com/deg/beads-utils" >&2
-exit 1
