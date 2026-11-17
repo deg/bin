@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+show_help() {
+  cat <<'EOF'
+android-contact-counts
+======================
+
+Count the contacts on a USB-connected Android phone, per account (Google,
+Outlook, WhatsApp, ...). Current Android no longer shows these counts
+anywhere on the phone itself.
+
+Usage:
+  android-contact-counts
+
+Output:
+  One line per account: count, account name, account type, largest first,
+  then a total. Run it twice a few minutes apart to watch a sync's progress.
+
+  The counts are per account, not per person: someone who is both in your
+  Outlook contacts and on WhatsApp appears once under each, so the total
+  is larger than the number of people in the Contacts app.
+
+One-time setup on the phone (manual; the script cannot do it):
+  1. Settings -> About phone -> tap "Build number" 7 times
+     (unlocks Developer options).
+  2. Settings -> System -> Developer options -> turn on "USB debugging".
+  3. Connect the phone by USB and tap "Allow" on its prompt.
+  USB debugging can be turned off again afterwards.
+
+Prerequisites on the Mac:
+  adb   (brew install --cask android-platform-tools)
+
+With more than one phone connected, choose one with ANDROID_SERIAL=<serial>
+(serials from `adb devices`).
+
+Options:
+  -h, --help    Show this help and exit
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) show_help; exit 0 ;;
+  "") ;;
+  *) echo "Unknown argument: $1" >&2; show_help >&2; exit 1 ;;
+esac
+
+if ! command -v adb >/dev/null; then
+  echo "Error: adb not found (brew install --cask android-platform-tools)." >&2
+  exit 2
+fi
+
+# get-state fails, with a usable message, when no phone is connected, more
+# than one is, or the phone has not yet allowed this Mac.
+if ! state="$(adb get-state 2>&1)"; then
+  echo "Error: no usable phone: $state" >&2
+  echo "See --help for the one-time phone setup." >&2
+  exit 3
+fi
+
+# raw_contacts, not contacts: the contacts table holds people already merged
+# across accounts, so only raw_contacts can be counted per account.
+# deleted=0 skips rows that are deleted on the phone but kept until the
+# deletion has synced back to their account.
+rows="$(adb shell content query \
+          --uri content://com.android.contacts/raw_contacts \
+          --projection account_type:account_name \
+          --where deleted=0)"
+
+# Each row reads: Row: 12 account_type=com.google, account_name=me@example.com
+counts="$(printf '%s\n' "$rows" \
+  | sed -n 's/^Row: [0-9]* account_type=\(.*\), account_name=\(.*\)$/\2	\1/p' \
+  | sort | uniq -c | sort -rn)"
+
+if [[ -z "$counts" ]]; then
+  echo "No contacts found on the phone."
+  exit 0
+fi
+
+printf '%s\n' "$counts" | awk '
+  {
+    n = $1
+    sub(/^ *[0-9]+ /, "")
+    split($0, f, "\t")
+    printf "%7d  %-30s  %s\n", n, f[1], f[2]
+    total += n
+  }
+  END { printf "%7d  total\n", total }'
